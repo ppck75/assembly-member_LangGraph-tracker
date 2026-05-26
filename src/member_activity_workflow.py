@@ -81,6 +81,7 @@ class MemberActivityState(TypedDict, total=False):
     enable_cosponsor_scan: bool
     show_progress: bool
     progress_callback: Any
+    llm_quota_exhausted: bool
     member_info: List[Dict[str, Any]]
     sponsored_bills: List[Dict[str, Any]]
     representative_bills: List[Dict[str, Any]]
@@ -122,6 +123,12 @@ def sanitize_error(error: Exception | str) -> str:
             text = text.replace(key, "***")
     text = re.sub(r"([?&]KEY=)[^&\s]+", r"\1***", text)
     return text
+
+
+def is_llm_quota_error(error: Exception | str) -> bool:
+    text = normalize_space(error)
+    upper = text.upper()
+    return "RESOURCE_EXHAUSTED" in upper or "QUOTA EXCEEDED" in upper or "429" in upper
 
 
 def normalize_space(value: Any) -> str:
@@ -584,6 +591,7 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "enable_cosponsor_scan": bool(state.get("enable_cosponsor_scan", DEFAULT_ENABLE_COSPONSOR_SCAN)),
         "show_progress": bool(state.get("show_progress", DEFAULT_SHOW_PROGRESS)),
         "progress_callback": state.get("progress_callback"),
+        "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
         "errors": [],
     }
     progress_log(normalized, f"입력 정리 완료: {member_name}, 요청 대수 {format_terms(requested_terms)}")
@@ -639,6 +647,50 @@ def make_fetch_member_info_node(client: AssemblyAPIClient):
     return fetch_member_info_node
 
 
+def member_bills_term_cache_key(
+    age: int,
+    member_name: str,
+    max_pages: int,
+    enable_cosponsor_scan: bool,
+    max_cosponsor_pages: int,
+) -> List[Any]:
+    return [
+        age,
+        normalize_space(member_name),
+        max_pages,
+        int(bool(enable_cosponsor_scan)),
+        max_cosponsor_pages,
+    ]
+
+
+def load_member_bills_term_cache(
+    age: int,
+    member_name: str,
+    max_pages: int,
+    enable_cosponsor_scan: bool,
+    max_cosponsor_pages: int,
+) -> Optional[List[Dict[str, Any]]]:
+    return load_cache(
+        "member_bills_by_term_v1",
+        member_bills_term_cache_key(age, member_name, max_pages, enable_cosponsor_scan, max_cosponsor_pages),
+    )
+
+
+def save_member_bills_term_cache(
+    age: int,
+    member_name: str,
+    max_pages: int,
+    enable_cosponsor_scan: bool,
+    max_cosponsor_pages: int,
+    rows: List[Dict[str, Any]],
+) -> None:
+    save_cache(
+        "member_bills_by_term_v1",
+        member_bills_term_cache_key(age, member_name, max_pages, enable_cosponsor_scan, max_cosponsor_pages),
+        rows,
+    )
+
+
 def make_fetch_bills_node(client: AssemblyAPIClient):
     def fetch_bills_node(state: MemberActivityState) -> MemberActivityState:
         errors = list(state.get("errors", []))
@@ -652,13 +704,26 @@ def make_fetch_bills_node(client: AssemblyAPIClient):
 
         for age in bill_terms:
             try:
+                cached_term_rows = load_member_bills_term_cache(
+                    age,
+                    member_name,
+                    max_pages,
+                    enable_cosponsor_scan,
+                    max_cosponsor_pages,
+                )
+                if cached_term_rows is not None:
+                    rows.extend(cached_term_rows)
+                    progress_log(state, f"{age}대 발의법안 대수 단위 캐시 사용: {len(cached_term_rows)}건")
+                    continue
+
                 before = len(rows)
+                term_rows: List[Dict[str, Any]] = []
                 for proposer in member_name_variants(member_name):
                     page_rows = client.get_rows(ENDPOINT_MEMBER_BILLS, {"AGE": age, "PROPOSER": proposer, "pSize": 100}, max_pages=max_pages)
                     for row in page_rows:
                         row["_REQUEST_AGE"] = age
                         row["_ROLE"] = classify_bill_role(row, member_name)
-                    rows.extend(page_rows)
+                    term_rows.extend(page_rows)
                 if enable_cosponsor_scan:
                     progress_log(state, f"{age}대 공동발의 보강 스캔: 최대 {max_cosponsor_pages}페이지")
                     scan_rows = client.get_rows(ENDPOINT_MEMBER_BILLS, {"AGE": age, "pSize": 100}, max_pages=max_cosponsor_pages)
@@ -666,7 +731,17 @@ def make_fetch_bills_node(client: AssemblyAPIClient):
                         if contains_name(row.get("PUBL_PROPOSER"), member_name):
                             row["_REQUEST_AGE"] = age
                             row["_ROLE"] = "공동발의"
-                            rows.append(row)
+                            term_rows.append(row)
+                term_rows = dedupe_records(term_rows, ["BILL_ID", "BILL_NO", "BILL_NAME"])
+                rows.extend(term_rows)
+                save_member_bills_term_cache(
+                    age,
+                    member_name,
+                    max_pages,
+                    enable_cosponsor_scan,
+                    max_cosponsor_pages,
+                    term_rows,
+                )
                 progress_log(state, f"{age}대 발의법안 조회 완료: {len(rows) - before}건 추가")
             except Exception as error:
                 errors.append(f"{age}대 발의법안 조회 실패: {sanitize_error(error)}")
@@ -806,6 +881,15 @@ def analyze_legislative_interests_node(state: MemberActivityState) -> MemberActi
     context = build_legislative_interest_context(state)
     if not bool(state.get("llm_insights_enabled", DEFAULT_LLM_INSIGHTS_ENABLED)):
         return {"legislative_interest_context": context, "legislative_interest_analysis": "", "legislative_interest_analysis_source": "disabled", "errors": errors}
+    if bool(state.get("llm_quota_exhausted", False)):
+        analysis = fallback_legislative_interest_analysis(context)
+        return {
+            "legislative_interest_context": context,
+            "legislative_interest_analysis": analysis,
+            "legislative_interest_analysis_source": "rule_fallback_quota",
+            "errors": errors,
+            "llm_quota_exhausted": True,
+        }
     progress_log(state, "입법 관심 분야 분석 시작")
     try:
         analysis, source = generate_legislative_interest_analysis(context)
@@ -815,9 +899,14 @@ def analyze_legislative_interests_node(state: MemberActivityState) -> MemberActi
             "legislative_interest_analysis": analysis,
             "legislative_interest_analysis_source": source,
             "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
         }
     except Exception as error:
-        errors.append(f"입법 관심 분야 LLM 분석 실패: {sanitize_error(error)}")
+        quota_exhausted = is_llm_quota_error(error)
+        if quota_exhausted:
+            errors.append("입법 관심 분야 LLM 분석은 Gemini 한도 초과로 규칙 기반 요약으로 대체했습니다.")
+        else:
+            errors.append(f"입법 관심 분야 LLM 분석 실패: {sanitize_error(error)}")
         analysis = fallback_legislative_interest_analysis(context)
         progress_log(state, "입법 관심 분야 분석 실패: 규칙 기반 요약으로 대체")
         return {
@@ -825,6 +914,7 @@ def analyze_legislative_interests_node(state: MemberActivityState) -> MemberActi
             "legislative_interest_analysis": analysis,
             "legislative_interest_analysis_source": "rule_fallback_after_error",
             "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)) or quota_exhausted,
         }
 
 
@@ -1258,14 +1348,38 @@ def analyze_vote_interpretation_node(state: MemberActivityState) -> MemberActivi
         return {"vote_interpretation_context": context, "vote_interpretation_analysis": "", "vote_interpretation_analysis_source": "empty", "errors": errors}
     if not bool(state.get("llm_insights_enabled", DEFAULT_LLM_INSIGHTS_ENABLED)):
         return {"vote_interpretation_context": context, "vote_interpretation_analysis": fallback_vote_interpretation_analysis(context), "vote_interpretation_analysis_source": "rule_fallback_disabled", "errors": errors}
+    if bool(state.get("llm_quota_exhausted", False)):
+        return {
+            "vote_interpretation_context": context,
+            "vote_interpretation_analysis": fallback_vote_interpretation_analysis(context),
+            "vote_interpretation_analysis_source": "rule_fallback_quota",
+            "errors": errors,
+            "llm_quota_exhausted": True,
+        }
     try:
         progress_log(state, "표결 통계 해석 메모 생성 시작")
         analysis, source = generate_vote_interpretation_analysis(context)
         progress_log(state, "표결 통계 해석 메모 생성 완료")
-        return {"vote_interpretation_context": context, "vote_interpretation_analysis": analysis, "vote_interpretation_analysis_source": source, "errors": errors}
+        return {
+            "vote_interpretation_context": context,
+            "vote_interpretation_analysis": analysis,
+            "vote_interpretation_analysis_source": source,
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
+        }
     except Exception as error:
-        errors.append(f"표결 통계 해석 메모 생성 실패: {sanitize_error(error)}")
-        return {"vote_interpretation_context": context, "vote_interpretation_analysis": fallback_vote_interpretation_analysis(context), "vote_interpretation_analysis_source": "rule_fallback_after_error", "errors": errors}
+        quota_exhausted = is_llm_quota_error(error)
+        if quota_exhausted:
+            errors.append("표결 통계 해석 메모는 Gemini 한도 초과로 규칙 기반 해석으로 대체했습니다.")
+        else:
+            errors.append(f"표결 통계 해석 메모 생성 실패: {sanitize_error(error)}")
+        return {
+            "vote_interpretation_context": context,
+            "vote_interpretation_analysis": fallback_vote_interpretation_analysis(context),
+            "vote_interpretation_analysis_source": "rule_fallback_after_error",
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)) or quota_exhausted,
+        }
 
 
 def make_analyze_party_alignment_node(client: AssemblyAPIClient):
@@ -1574,7 +1688,11 @@ def search_recent_member_news_node(state: MemberActivityState) -> MemberActivity
     progress_log(state, "최근 의원 관련 뉴스 검색 시작")
     try:
         query, items, fetch_source = fetch_recent_member_news(member_name, party_name, DEFAULT_RECENT_NEWS_LIMIT)
-        analysis, analysis_source = generate_recent_news_analysis(member_name, party_name, query, items)
+        if bool(state.get("llm_quota_exhausted", False)):
+            analysis = fallback_recent_news_analysis(member_name, party_name, items)
+            analysis_source = "rule_fallback_quota"
+        else:
+            analysis, analysis_source = generate_recent_news_analysis(member_name, party_name, query, items)
         progress_log(state, f"최근 의원 관련 뉴스 검색 완료: {len(items)}건, {fetch_source}, {analysis_source}")
         return {
             "recent_news_query": query,
@@ -1582,16 +1700,33 @@ def search_recent_member_news_node(state: MemberActivityState) -> MemberActivity
             "recent_news_analysis": analysis,
             "recent_news_analysis_source": analysis_source,
             "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
         }
     except Exception as error:
+        quota_exhausted = is_llm_quota_error(error)
+        query = normalize_space(f"{member_name} 국회의원 {party_name}")
+        if quota_exhausted:
+            errors.append("최근 의원 관련 이슈 LLM 요약은 Gemini 한도 초과로 기사 목록 기반 요약으로 대체했습니다.")
+            _, items, _ = fetch_recent_member_news(member_name, party_name, DEFAULT_RECENT_NEWS_LIMIT)
+            analysis = fallback_recent_news_analysis(member_name, party_name, items)
+            progress_log(state, "최근 의원 관련 뉴스 검색 완료: Gemini 한도 초과, 기사 목록 기반 요약으로 대체")
+            return {
+                "recent_news_query": query,
+                "recent_news_items": items,
+                "recent_news_analysis": analysis,
+                "recent_news_analysis_source": "rule_fallback_after_quota",
+                "errors": errors,
+                "llm_quota_exhausted": True,
+            }
         errors.append(f"최근 의원 관련 뉴스 검색 실패: {sanitize_error(error)}")
         progress_log(state, "최근 의원 관련 뉴스 검색 실패")
         return {
-            "recent_news_query": normalize_space(f"{member_name} 국회의원 {party_name}"),
+            "recent_news_query": query,
             "recent_news_items": [],
             "recent_news_analysis": "최근 뉴스 검색에 실패해 의원 관련 이슈를 요약하지 못했습니다.",
             "recent_news_analysis_source": "error",
             "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
         }
 
 
