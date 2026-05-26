@@ -9,8 +9,6 @@ import streamlit as st
 
 from src.member_activity_workflow import (
     DEFAULT_ENABLE_COSPONSOR_SCAN,
-    DEFAULT_MAX_BILL_PAGES,
-    DEFAULT_MAX_COSPONSOR_SCAN_PAGES,
     DEFAULT_MAX_VOTE_BILLS_TO_SCAN,
     DEFAULT_MAX_VOTE_PAGES,
     DEFAULT_PARTY_ALIGNMENT_LIMIT,
@@ -23,7 +21,7 @@ from src.member_activity_workflow import (
     make_fetch_votes_node,
     parse_term_selection,
 )
-from src.streamlit_runtime import get_client, run_member_activity_workflow
+from src.streamlit_runtime import get_client, get_member_activity_app
 
 
 st.set_page_config(
@@ -32,6 +30,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+APP_FULL_PAGE_SCAN = 200
 
 
 def as_dataframe(rows: Iterable[Dict[str, Any]], columns: List[str] | None = None) -> pd.DataFrame:
@@ -89,6 +89,26 @@ def build_initial_state(member_name: str, options: Dict[str, Any]) -> Dict[str, 
     }
 
 
+WORKFLOW_STEPS = [
+    ("normalize_user_request", "입력값 정리", "의원명과 조회 옵션을 정리합니다."),
+    ("get_member_info", "의원 기본정보 조회", "재임 대수, 정당, 선거구, 위원회 정보를 확인합니다."),
+    ("search_member_bills", "발의법안 조회", "대표발의와 공동발의 법안을 수집합니다."),
+    ("analyze_legislative_interests", "입법 관심 분야 분석", "발의법안 통계를 바탕으로 관심 의제를 요약합니다."),
+    ("get_all_member_votes", "표결 상세 조회", "본회의 표결 기록을 조회하고 찬성·반대·기권·불참으로 분류합니다."),
+    ("analyze_party_alignment", "정당 다수 입장 일치도 분석", "같은 정당 의원 다수 입장과의 일치 여부를 계산합니다."),
+    ("interpret_vote_statistics", "표결 해석 메모 생성", "분석 범위와 불참 비중을 고려한 해석 주의사항을 만듭니다."),
+    ("search_recent_member_news", "최근 이슈 검색", "최근 뉴스 검색 결과를 바탕으로 공개 이슈를 요약합니다."),
+    ("summarize_member_activity", "최종 결과 정리", "전체 분석 결과를 화면에 표시할 형태로 정리합니다."),
+]
+
+WORKFLOW_STEP_LABELS = {node: label for node, label, _ in WORKFLOW_STEPS}
+WORKFLOW_STEP_DESCRIPTIONS = {node: description for node, _, description in WORKFLOW_STEPS}
+WORKFLOW_PROGRESS = {
+    node: int((index + 1) / len(WORKFLOW_STEPS) * 100)
+    for index, (node, _, _) in enumerate(WORKFLOW_STEPS)
+}
+
+
 def configure_user_gemini_key(gemini_api_key: str) -> None:
     key = gemini_api_key.strip()
     if key:
@@ -98,10 +118,60 @@ def configure_user_gemini_key(gemini_api_key: str) -> None:
 
 
 def run_analysis(member_name: str, options: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    initial_state = build_initial_state(member_name, options)
+    app = get_member_activity_app()
+
+    progress = st.progress(0, text="분석을 시작합니다.")
+    step_box = st.empty()
+    detail_box = st.empty()
+    completed_box = st.container()
+    completed_steps: List[str] = []
+
+    def progress_callback(message: str) -> None:
+        detail_box.caption(f"세부 진행: {message}")
+
+    initial_state["progress_callback"] = progress_callback
+
     with st.status("의원 활동을 조회하고 있습니다.", expanded=True) as status:
         st.write("의원 기본정보, 발의법안, 표결정보, 정당 일치도, 최근 이슈를 순서대로 분석합니다.")
-        result = run_member_activity_workflow(build_initial_state(member_name, options))
+        for event in app.stream(initial_state, stream_mode="updates"):
+            for node_name, node_update in event.items():
+                label = WORKFLOW_STEP_LABELS.get(node_name, node_name)
+                description = WORKFLOW_STEP_DESCRIPTIONS.get(node_name, "")
+                percent = WORKFLOW_PROGRESS.get(node_name, min(95, len(completed_steps) * 10))
+
+                progress.progress(percent, text=f"{label} 완료 ({percent}%)")
+                step_box.info(f"현재 단계: {label}\n\n{description}")
+
+                if node_update:
+                    result.update(node_update)
+                    result.pop("progress_callback", None)
+
+                if label not in completed_steps:
+                    completed_steps.append(label)
+                    completed_box.write(f"✅ {label} 완료")
+
+                if node_name == "get_all_member_votes" and result.get("vote_fetch_stats"):
+                    stats = result.get("vote_fetch_stats", [])
+                    total_bills = sum(int(item.get("표결의안", 0) or 0) for item in stats)
+                    total_success = sum(int(item.get("상세조회성공", 0) or 0) for item in stats)
+                    total_failed = sum(int(item.get("상세조회실패", 0) or 0) for item in stats)
+                    st.caption(f"표결 상세 조회 상태: 대상 {total_bills:,}건 / 성공 {total_success:,}건 / 실패 {total_failed:,}건")
+
+                if node_name == "analyze_party_alignment" and result.get("party_alignment_fetch_stats"):
+                    stats = result.get("party_alignment_fetch_stats", [])
+                    total_target = sum(int(item.get("분석대상표결", 0) or 0) for item in stats)
+                    cache_hits = sum(int(item.get("BILL_ID캐시적중", 0) or 0) for item in stats)
+                    api_targets = sum(int(item.get("API신규조회대상", 0) or 0) for item in stats)
+                    st.caption(f"정당 일치도 분석 상태: 대상 {total_target:,}건 / 캐시 {cache_hits:,}건 / 신규 API 조회 {api_targets:,}건")
+
+        progress.progress(100, text="분석 완료")
         status.update(label="분석 완료", state="complete", expanded=False)
+
+    if not result:
+        raise RuntimeError("워크플로우 결과가 비어 있습니다.")
+    result.pop("progress_callback", None)
     return result
 
 
@@ -316,22 +386,40 @@ with st.sidebar:
     member_name = st.text_input("국회의원 이름", placeholder="예: 이준석, 추미애, 주광덕")
     st.divider()
     st.subheader("분석 옵션")
-    party_alignment_limit = st.number_input("정당 일치도 최근 N건, 전체는 0", min_value=0, max_value=5000, value=DEFAULT_PARTY_ALIGNMENT_LIMIT, step=10)
+    party_alignment_limit = st.number_input(
+        "정당 일치도 최근 N건, 전체는 0",
+        min_value=0,
+        max_value=5000,
+        value=DEFAULT_PARTY_ALIGNMENT_LIMIT,
+        step=10,
+        help=(
+            "정당 다수 입장과 의원 표결을 비교할 표결 수입니다. "
+            "50은 빠르게 최근 경향을 봅니다. 값을 높이면 더 많은 표결을 반영하지만 오래 걸릴 수 있습니다. "
+            "0은 해당 대수 전체 표결을 분석하므로 가장 무겁습니다."
+        ),
+    )
     vote_scan_mode = st.radio(
         "초기 표결 상세 조회 범위",
         options=["전체", "최근 50건", "최근 200건"],
-        index=0,
-        help="전체 조회는 정확하지만 오래 걸릴 수 있습니다. 캐시가 있으면 빨라집니다.",
+        index=2,
+        help=(
+            "처음 화면에 보여줄 의원별 찬성·반대·기권·불참 표결의 범위입니다. "
+            "최근 50건은 가장 빠르고, 최근 200건은 속도와 정보량의 균형형입니다. "
+            "전체는 해당 대수 표결을 모두 조회해 가장 포괄적이지만 첫 실행 시 수 분 이상 걸릴 수 있습니다."
+        ),
     )
+    if vote_scan_mode == "전체":
+        st.warning("전체 표결 조회는 첫 실행 또는 캐시 만료 시 수 분 이상 걸릴 수 있습니다.", icon="⏳")
     max_vote_bills = {
         "전체": DEFAULT_MAX_VOTE_BILLS_TO_SCAN,
         "최근 50건": 50,
         "최근 200건": 200,
     }[vote_scan_mode]
-    max_bill_pages = st.slider("발의법안 조회 페이지 수", min_value=1, max_value=10, value=DEFAULT_MAX_BILL_PAGES)
-    vote_fetch_workers = st.slider("표결 병렬 조회 수", min_value=1, max_value=16, value=DEFAULT_VOTE_FETCH_WORKERS)
-    enable_cosponsor_scan = st.checkbox("공동발의 보강 스캔", value=DEFAULT_ENABLE_COSPONSOR_SCAN)
-    max_cosponsor_scan_pages = st.slider("공동발의 스캔 페이지 수", min_value=1, max_value=20, value=DEFAULT_MAX_COSPONSOR_SCAN_PAGES)
+    enable_cosponsor_scan = st.checkbox(
+        "공동발의 보강 스캔",
+        value=DEFAULT_ENABLE_COSPONSOR_SCAN,
+        help="공동발의 법안 누락을 줄이기 위해 발의법안 목록을 추가 확인합니다. 끄면 더 빠르지만 공동발의가 일부 빠질 수 있습니다.",
+    )
     party_alignment_enabled = st.checkbox("정당 다수 입장 일치 분석", value=True)
     llm_insights_enabled = st.checkbox("Gemini 해석 사용", value=True, disabled=not bool(gemini_api_key.strip()))
     if not gemini_api_key.strip():
@@ -341,10 +429,10 @@ with st.sidebar:
 options = {
     "party_alignment_vote_limit": int(party_alignment_limit),
     "max_vote_bills_to_scan": int(max_vote_bills),
-    "max_bill_pages": int(max_bill_pages),
-    "vote_fetch_workers": int(vote_fetch_workers),
+    "max_bill_pages": APP_FULL_PAGE_SCAN,
+    "vote_fetch_workers": DEFAULT_VOTE_FETCH_WORKERS,
     "enable_cosponsor_scan": bool(enable_cosponsor_scan),
-    "max_cosponsor_scan_pages": int(max_cosponsor_scan_pages),
+    "max_cosponsor_scan_pages": APP_FULL_PAGE_SCAN,
     "party_alignment_enabled": bool(party_alignment_enabled),
     "llm_insights_enabled": bool(llm_insights_enabled),
 }

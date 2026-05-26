@@ -80,6 +80,7 @@ class MemberActivityState(TypedDict, total=False):
     max_cosponsor_scan_pages: int
     enable_cosponsor_scan: bool
     show_progress: bool
+    progress_callback: Any
     member_info: List[Dict[str, Any]]
     sponsored_bills: List[Dict[str, Any]]
     representative_bills: List[Dict[str, Any]]
@@ -247,6 +248,12 @@ def extract_served_terms(member_records: List[Dict[str, Any]]) -> List[int]:
 
 
 def progress_log(state: MemberActivityState, message: str) -> None:
+    callback = state.get("progress_callback")
+    if callable(callback):
+        try:
+            callback(message)
+        except Exception:
+            pass
     if state.get("show_progress", DEFAULT_SHOW_PROGRESS):
         print(f"[진행] {message}", flush=True)
 
@@ -576,6 +583,7 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "max_cosponsor_scan_pages": int(state.get("max_cosponsor_scan_pages") or DEFAULT_MAX_COSPONSOR_SCAN_PAGES),
         "enable_cosponsor_scan": bool(state.get("enable_cosponsor_scan", DEFAULT_ENABLE_COSPONSOR_SCAN)),
         "show_progress": bool(state.get("show_progress", DEFAULT_SHOW_PROGRESS)),
+        "progress_callback": state.get("progress_callback"),
         "errors": [],
     }
     progress_log(normalized, f"입력 정리 완료: {member_name}, 요청 대수 {format_terms(requested_terms)}")
