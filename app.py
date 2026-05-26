@@ -9,6 +9,8 @@ import streamlit as st
 
 from src.member_activity_workflow import (
     DEFAULT_ENABLE_COSPONSOR_SCAN,
+    DEFAULT_MAX_BILL_PAGES,
+    DEFAULT_MAX_COSPONSOR_SCAN_PAGES,
     DEFAULT_MAX_VOTE_BILLS_TO_SCAN,
     DEFAULT_MAX_VOTE_PAGES,
     DEFAULT_PARTY_ALIGNMENT_LIMIT,
@@ -31,7 +33,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_FULL_PAGE_SCAN = 200
+APP_BILL_PAGE_SCAN = DEFAULT_MAX_BILL_PAGES
+APP_COSPONSOR_SCAN_PAGES = DEFAULT_MAX_COSPONSOR_SCAN_PAGES
 
 
 def as_dataframe(rows: Iterable[Dict[str, Any]], columns: List[str] | None = None) -> pd.DataFrame:
@@ -429,10 +432,10 @@ with st.sidebar:
 options = {
     "party_alignment_vote_limit": int(party_alignment_limit),
     "max_vote_bills_to_scan": int(max_vote_bills),
-    "max_bill_pages": APP_FULL_PAGE_SCAN,
+    "max_bill_pages": APP_BILL_PAGE_SCAN,
     "vote_fetch_workers": DEFAULT_VOTE_FETCH_WORKERS,
     "enable_cosponsor_scan": bool(enable_cosponsor_scan),
-    "max_cosponsor_scan_pages": APP_FULL_PAGE_SCAN,
+    "max_cosponsor_scan_pages": APP_COSPONSOR_SCAN_PAGES,
     "party_alignment_enabled": bool(party_alignment_enabled),
     "llm_insights_enabled": bool(llm_insights_enabled),
 }
