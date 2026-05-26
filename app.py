@@ -424,9 +424,9 @@ with st.sidebar:
         help="공동발의 법안 누락을 줄이기 위해 발의법안 목록을 추가 확인합니다. 끄면 더 빠르지만 공동발의가 일부 빠질 수 있습니다.",
     )
     party_alignment_enabled = st.checkbox("정당 다수 입장 일치 분석", value=True)
-    llm_insights_enabled = st.checkbox("Gemini 해석 사용", value=True, disabled=not bool(gemini_api_key.strip()))
+    llm_insights_enabled = st.checkbox("LLM 분석 사용", value=True, disabled=not bool(gemini_api_key.strip()))
     if not gemini_api_key.strip():
-        st.caption("Gemini 해석을 사용하려면 페이지 상단에 API 키를 입력하세요.")
+        st.caption("LLM 분석을 사용하려면 페이지 상단에 Gemini API 키를 입력하세요.")
     run_button = st.button("분석 시작", type="primary", use_container_width=True)
 
 options = {

@@ -873,6 +873,16 @@ def normalize_cached_vote_rows(rows: List[Dict[str, Any]], age: int) -> List[Dic
     return normalized
 
 
+def normalize_member_vote_rows(rows: List[Dict[str, Any]], age: int) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for row in rows:
+        fixed = dict(row)
+        fixed["_REQUEST_AGE"] = age
+        fixed["_VOTE_RESULT"] = normalize_vote_result(fixed)
+        normalized.append(fixed)
+    return normalized
+
+
 def filter_member_vote_rows(rows: List[Dict[str, Any]], member_name: str, mona_codes: List[str]) -> List[Dict[str, Any]]:
     normalized_name = normalize_space(member_name).replace("의원", "")
     code_set = {normalize_space(code) for code in mona_codes if normalize_space(code)}
@@ -885,6 +895,35 @@ def filter_member_vote_rows(rows: List[Dict[str, Any]], member_name: str, mona_c
         elif row_code and row_code in code_set:
             matched.append(row)
     return matched
+
+
+def fetch_member_votes_direct_for_term(
+    client: AssemblyAPIClient,
+    age: int,
+    member_name: str,
+    mona_codes: List[str],
+    max_pages: int,
+    limit: int = 0,
+) -> List[Dict[str, Any]]:
+    query_attempts: List[Dict[str, Any]] = [{"AGE": age, "HG_NM": member_name, "pSize": 100}]
+    query_attempts.extend({"AGE": age, "MONA_CD": code, "pSize": 100} for code in mona_codes)
+
+    for query in query_attempts:
+        page_rows = client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=max_pages)
+        matched_rows = filter_member_vote_rows(page_rows, member_name, mona_codes)
+        if not matched_rows and normalize_space(query.get("HG_NM")) == member_name:
+            # Some API responses already apply HG_NM but omit a name/code column in edge cases.
+            matched_rows = page_rows
+        if not matched_rows:
+            continue
+
+        rows = normalize_member_vote_rows(matched_rows, age)
+        rows = dedupe_records(rows, ["BILL_ID", "BILL_NO", "HG_NM", "VOTE_DATE", "RESULT_VOTE_MOD"])
+        rows = sorted(rows, key=lambda row: date_sort_value(row, "VOTE_DATE", "PROC_DT"), reverse=True)
+        if limit and limit > 0:
+            rows = rows[:limit]
+        return rows
+    return []
 
 
 def fetch_member_vote_for_bill(
@@ -1357,8 +1396,23 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
                     progress_log(state, f"{age}대 표결정보 대수 단위 캐시 사용: {len(cached_rows)}건")
                     continue
 
+                progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 시도")
+                direct_rows = fetch_member_votes_direct_for_term(client, age, member_name, mona_codes, max_pages=max_pages, limit=max_vote_bills)
+                if direct_rows:
+                    term_stat["표결의안"] = len(direct_rows)
+                    term_stat["상세조회성공"] = len(direct_rows)
+                    term_stat["매칭표결"] = len(direct_rows)
+                    term_stat["조회방식"] = "의원명일괄조회"
+                    rows.extend(direct_rows)
+                    save_member_votes_term_cache(age, member_name, max_pages, max_vote_bills, {"rows": direct_rows, "stat": term_stat})
+                    progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 완료: {len(direct_rows)}건")
+                    vote_fetch_stats.append(term_stat)
+                    continue
+
+                progress_log(state, f"{age}대 의원명 기준 일괄 조회 결과 없음: BILL_ID별 병렬 조회로 전환")
                 vote_bills = fetch_vote_bill_candidates(client, age, max_pages=max_pages, limit=max_vote_bills)
                 term_stat["표결의안"] = len(vote_bills)
+                term_stat["조회방식"] = "BILL_ID별조회"
                 progress_log(state, f"{age}대 표결 의안 후보 {len(vote_bills)}건 확보")
                 completed = 0
                 term_rows: List[Dict[str, Any]] = []
