@@ -1677,7 +1677,7 @@ def fallback_recent_news_analysis(member_name: str, party_name: str, items: List
 def generate_recent_news_analysis(member_name: str, party_name: str, query: str, items: List[Dict[str, Any]]) -> tuple[str, str]:
     cache_key = [
         "google",
-        "url_citation_v2",
+        "separated_evidence_v3",
         DEFAULT_LLM_MODEL,
         query,
         json.dumps([{k: item.get(k, "") for k in ["title", "source", "published", "url", "snippet"]} for item in items], ensure_ascii=False, sort_keys=True),
@@ -1698,8 +1698,8 @@ def generate_recent_news_analysis(member_name: str, party_name: str, query: str,
 
 요구 출력:
 - 최근 의원 관련 이슈 3~5개를 Markdown bullet로 요약
-- 각 이슈에 근거가 되는 기사 제목, 언론사, URL을 함께 표시
-- URL은 Markdown 링크 형식 `[언론사 또는 기사제목](URL)`으로 제시
+- 기사 URL이나 언론사 링크 목록은 출력하지 말 것
+- 각 bullet은 이슈명과 요약 문장만 포함할 것
 - 기사 제목/요약 기반의 해석임을 밝히고, 사실관계 단정 금지
 - 열린국회정보 API 기반 공식 의정활동 데이터와 구분된 웹 검색 기반 맥락임을 마지막에 주의문으로 포함
 

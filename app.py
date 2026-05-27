@@ -4,6 +4,7 @@ import html
 import io
 import json
 import os
+import re
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
@@ -372,7 +373,17 @@ def clean_vote_interpretation_text(value: Any) -> str:
     for line in text.splitlines():
         stripped = line.strip()
         heading_text = stripped.lstrip("#").strip()
-        if heading_text in {"표결 통계 해석 시 주의할 점", "표결 통계 해석 시 주의사항"}:
+        if heading_text in {"표결 통계 해석 시 주의할 점"}:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def clean_recent_news_analysis_text(value: Any) -> str:
+    lines: List[str] = []
+    for line in str(value or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^[-*]\s*\[[^\]]+\]\([^)]+\)\s*$", stripped):
             continue
         lines.append(line)
     return "\n".join(lines).strip()
@@ -727,13 +738,28 @@ def render_vote_fetch_text(result: Dict[str, Any]) -> None:
     st.markdown("\n".join(lines))
 
 
+def render_member_profile_photo(result: Dict[str, Any]) -> None:
+    for row in result.get("member_info", []):
+        image_url = str(row.get("NAAS_PIC") or "").strip()
+        if image_url:
+            st.image(image_url, width=150)
+            return
+
+
 def render_news_table_timeline(result: Dict[str, Any]) -> None:
     items = result.get("recent_news_items", [])
     st.subheader("최근 이슈")
-    st.markdown(result.get("recent_news_analysis") or "최근 이슈 분석 결과가 없습니다.")
+    analysis = clean_recent_news_analysis_text(result.get("recent_news_analysis"))
+    with st.container(border=True):
+        st.markdown("#### LLM 분석 요약")
+        st.caption("아래 요약은 바로 밑의 뉴스 검색 결과를 근거 자료로 사용해 생성한 해석입니다.")
+        st.markdown(analysis or "최근 이슈 분석 결과가 없습니다.")
     if not items:
         st.info("최근 뉴스 데이터가 없습니다.")
         return
+
+    st.markdown("#### 분석 근거 뉴스")
+    st.caption("LLM 분석에 사용된 원 뉴스 검색 결과입니다. 기사 제목을 눌러 원문을 확인할 수 있습니다.")
 
     safe_items = [
         {
@@ -817,6 +843,7 @@ def render_summary_tab(result: Dict[str, Any]) -> None:
     st.divider()
 
     st.subheader("의원 프로필")
+    render_member_profile_photo(result)
     st.markdown(result.get("profile_summary", "프로필 정보가 없습니다."))
     render_summary_scope(result)
     st.divider()
