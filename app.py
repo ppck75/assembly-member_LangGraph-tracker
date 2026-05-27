@@ -180,6 +180,12 @@ def change_member_directory_page(key_prefix: str, delta: int) -> None:
     st.session_state[page_key] = max(1, int(st.session_state.get(page_key, 1)) + delta)
 
 
+def show_member_directory(key_prefix: str = "member_directory") -> None:
+    st.session_state["show_member_directory"] = True
+    st.session_state[f"{key_prefix}_term"] = f"{DEFAULT_MEMBER_DIRECTORY_TERM}대"
+    st.session_state[f"{key_prefix}_page"] = 1
+
+
 def render_member_card(member: Dict[str, Any], *, key_prefix: str) -> None:
     name = html.escape(str(member.get("name") or "이름 미확인"))
     party = html.escape(str(member.get("party") or "정당 미확인"))
@@ -238,7 +244,7 @@ def render_member_directory_panel(*, key_prefix: str = "member_directory") -> No
     term_options = ["전체"] + [f"{term}대" for term in MEMBER_DIRECTORY_TERMS]
     default_term_index = term_options.index(f"{DEFAULT_MEMBER_DIRECTORY_TERM}대")
     selected_term_label = st.selectbox("대수", term_options, index=default_term_index, key=f"{key_prefix}_term")
-    st.caption("참고: 열린국회정보 API 기준 20대, 21대, 22대 의원 목록 조회가 가능합니다.")
+    st.caption("2대 ~ 22대 의원 목록 조회가 가능합니다.")
     selected_term = None if selected_term_label == "전체" else int(str(selected_term_label).replace("대", ""))
     members = [
         member
@@ -337,8 +343,7 @@ def render_member_directory_section() -> None:
     with st.expander("의원 목록 조회", expanded=not st.session_state.get("member_activity_result")):
         st.caption("카드에서 의원을 선택하면 왼쪽 사이드바의 국회의원 이름 입력칸에 반영됩니다.")
         st.caption("의원 목록을 처음 조회할 때는 API 호출과 캐시 생성으로 아주 잠깐 시간이 걸릴 수 있습니다.")
-        if st.button("의원 목록 불러오기", use_container_width=True):
-            st.session_state["show_member_directory"] = True
+        st.button("의원 목록 불러오기", use_container_width=True, on_click=show_member_directory)
         if st.session_state["show_member_directory"]:
             render_member_directory_panel()
         else:
@@ -1050,7 +1055,7 @@ gemini_api_key = st.text_input(
     "Gemini API 키",
     type="password",
     value=st.session_state.get("GEMINI_API_KEY", ""),
-    placeholder="AIza...",
+    placeholder="발급 받은 key를 입력하세요",
 )
 st.caption("키 발급: https://aistudio.google.com/apikey")
 st.caption(f"사용 모델: `{DEFAULT_LLM_MODEL}`")
@@ -1059,7 +1064,7 @@ if gemini_api_key:
 
 with st.sidebar:
     st.header("조회 설정")
-    member_name = st.text_input("국회의원 이름", placeholder="예: 이준석, 추미애, 주광덕", key="member_name_input")
+    member_name = st.text_input("국회의원 이름", key="member_name_input")
     st.caption("의원 목록 조회 카드에서 의원을 선택하거나, 직접 입력하여 분석을 시작하세요.")
     st.divider()
     st.subheader("분석 옵션")
