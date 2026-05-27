@@ -28,7 +28,7 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v11_readable_output"
+WORKFLOW_VERSION = "member_activity_v12_vote_fallback"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
@@ -70,6 +70,8 @@ class MemberActivityState(TypedDict, total=False):
     analysis_terms: List[int]
     non_served_terms: List[int]
     recent_limit: int
+    bills_enabled: bool
+    vote_detail_enabled: bool
     max_bill_pages: int
     max_vote_pages: int
     max_vote_bills_to_scan: int
@@ -77,6 +79,7 @@ class MemberActivityState(TypedDict, total=False):
     party_alignment_enabled: bool
     party_alignment_vote_limit: int
     llm_insights_enabled: bool
+    recent_news_enabled: bool
     max_cosponsor_scan_pages: int
     enable_cosponsor_scan: bool
     show_progress: bool
@@ -580,6 +583,8 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "analysis_terms": requested_terms,
         "non_served_terms": [],
         "recent_limit": int(state.get("recent_limit") or DEFAULT_RECENT_LIMIT),
+        "bills_enabled": bool(state.get("bills_enabled", True)),
+        "vote_detail_enabled": bool(state.get("vote_detail_enabled", True)),
         "max_bill_pages": int(state.get("max_bill_pages") or DEFAULT_MAX_BILL_PAGES),
         "max_vote_pages": int(state.get("max_vote_pages") or DEFAULT_MAX_VOTE_PAGES),
         "max_vote_bills_to_scan": int(state.get("max_vote_bills_to_scan", DEFAULT_MAX_VOTE_BILLS_TO_SCAN)),
@@ -587,6 +592,7 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "party_alignment_enabled": bool(state.get("party_alignment_enabled", True)),
         "party_alignment_vote_limit": int(state.get("party_alignment_vote_limit", DEFAULT_PARTY_ALIGNMENT_LIMIT)),
         "llm_insights_enabled": bool(state.get("llm_insights_enabled", DEFAULT_LLM_INSIGHTS_ENABLED)),
+        "recent_news_enabled": bool(state.get("recent_news_enabled", True)),
         "max_cosponsor_scan_pages": int(state.get("max_cosponsor_scan_pages") or DEFAULT_MAX_COSPONSOR_SCAN_PAGES),
         "enable_cosponsor_scan": bool(state.get("enable_cosponsor_scan", DEFAULT_ENABLE_COSPONSOR_SCAN)),
         "show_progress": bool(state.get("show_progress", DEFAULT_SHOW_PROGRESS)),
@@ -694,6 +700,16 @@ def save_member_bills_term_cache(
 def make_fetch_bills_node(client: AssemblyAPIClient):
     def fetch_bills_node(state: MemberActivityState) -> MemberActivityState:
         errors = list(state.get("errors", []))
+        if not bool(state.get("bills_enabled", True)):
+            progress_log(state, "발의법안 조회 생략: 옵션 꺼짐")
+            return {
+                "sponsored_bills": [],
+                "representative_bills": [],
+                "cosponsored_bills": [],
+                "bill_result_stats": [],
+                "bill_committee_stats": [],
+                "errors": errors,
+            }
         member_name = state["member_name"]
         max_pages = int(state.get("max_bill_pages") or DEFAULT_MAX_BILL_PAGES)
         max_cosponsor_pages = int(state.get("max_cosponsor_scan_pages") or DEFAULT_MAX_COSPONSOR_SCAN_PAGES)
@@ -725,7 +741,7 @@ def make_fetch_bills_node(client: AssemblyAPIClient):
                         row["_ROLE"] = classify_bill_role(row, member_name)
                     term_rows.extend(page_rows)
                 if enable_cosponsor_scan:
-                    progress_log(state, f"{age}대 공동발의 보강 스캔: 최대 {max_cosponsor_pages}페이지")
+                    progress_log(state, f"{age}대 발의법안 공동발의 확인: 최대 {max_cosponsor_pages}페이지")
                     scan_rows = client.get_rows(ENDPOINT_MEMBER_BILLS, {"AGE": age, "pSize": 100}, max_pages=max_cosponsor_pages)
                     for row in scan_rows:
                         if contains_name(row.get("PUBL_PROPOSER"), member_name):
@@ -756,7 +772,7 @@ def make_fetch_bills_node(client: AssemblyAPIClient):
         if not enable_cosponsor_scan:
             errors.append("공동발의 전체 스캔이 꺼져 있습니다. 공동발의 누락이 의심되면 enable_cosponsor_scan=True로 다시 실행하세요.")
         elif not cosponsored:
-            errors.append("공동발의 보강 스캔 범위에서 공동발의 법안을 찾지 못했습니다. 더 넓게 보려면 max_cosponsor_scan_pages를 늘리세요.")
+            errors.append("발의법안 공동발의 확인 범위에서 공동발의 법안을 찾지 못했습니다. 더 넓게 보려면 max_cosponsor_scan_pages를 늘리세요.")
         progress_log(state, f"발의법안 정리 완료: 전체 {len(rows)}건, 대표 {len(representative)}건, 공동 {len(cosponsored)}건")
         return {
             "sponsored_bills": rows,
@@ -879,6 +895,8 @@ context:
 def analyze_legislative_interests_node(state: MemberActivityState) -> MemberActivityState:
     errors = list(state.get("errors", []))
     context = build_legislative_interest_context(state)
+    if not bool(state.get("bills_enabled", True)):
+        return {"legislative_interest_context": context, "legislative_interest_analysis": "", "legislative_interest_analysis_source": "disabled_bills", "errors": errors}
     if not bool(state.get("llm_insights_enabled", DEFAULT_LLM_INSIGHTS_ENABLED)):
         return {"legislative_interest_context": context, "legislative_interest_analysis": "", "legislative_interest_analysis_source": "disabled", "errors": errors}
     if bool(state.get("llm_quota_exhausted", False)):
@@ -1480,6 +1498,18 @@ def summarize_votes_by_term(rows: List[Dict[str, Any]], vote_terms: List[int]) -
 def make_fetch_votes_node(client: AssemblyAPIClient):
     def fetch_votes_node(state: MemberActivityState) -> MemberActivityState:
         errors = list(state.get("errors", []))
+        if not bool(state.get("vote_detail_enabled", True)):
+            progress_log(state, "표결정보 조회 생략: 옵션 꺼짐")
+            return {
+                "vote_records": [],
+                "yes_votes": [],
+                "no_votes": [],
+                "abstain_votes": [],
+                "absent_votes": [],
+                "vote_summary_by_term": [],
+                "vote_fetch_stats": [],
+                "errors": errors,
+            }
         member_name = state["member_name"]
         max_pages = int(state.get("max_vote_pages") or DEFAULT_MAX_VOTE_PAGES)
         max_vote_bills = int(state.get("max_vote_bills_to_scan", DEFAULT_MAX_VOTE_BILLS_TO_SCAN))
@@ -1511,7 +1541,11 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
                     continue
 
                 progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 시도")
-                direct_rows = fetch_member_votes_direct_for_term(client, age, member_name, mona_codes, max_pages=max_pages, limit=max_vote_bills)
+                try:
+                    direct_rows = fetch_member_votes_direct_for_term(client, age, member_name, mona_codes, max_pages=max_pages, limit=max_vote_bills)
+                except Exception as error:
+                    direct_rows = []
+                    progress_log(state, f"{age}대 의원명 기준 일괄 조회 실패: BILL_ID별 조회로 전환")
                 if direct_rows:
                     term_stat["표결의안"] = len(direct_rows)
                     term_stat["상세조회성공"] = len(direct_rows)
@@ -1683,6 +1717,16 @@ def generate_recent_news_analysis(member_name: str, party_name: str, query: str,
 
 def search_recent_member_news_node(state: MemberActivityState) -> MemberActivityState:
     errors = list(state.get("errors", []))
+    if not bool(state.get("recent_news_enabled", True)):
+        progress_log(state, "최근 의원 관련 뉴스 검색 생략: 옵션 꺼짐")
+        return {
+            "recent_news_query": "",
+            "recent_news_items": [],
+            "recent_news_analysis": "",
+            "recent_news_analysis_source": "disabled",
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
+        }
     member_name = state.get("member_name", "")
     party_name = member_party_for_news_query(state)
     progress_log(state, "최근 의원 관련 뉴스 검색 시작")
