@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import html
 import io
 import json
@@ -9,7 +8,6 @@ import re
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
-import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -51,25 +49,11 @@ APP_VOTE_DETAIL_SLIDER_MAX = 1000
 APP_PARTY_ALIGNMENT_SLIDER_MAX = 500
 MEMBER_DIRECTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 MEMBER_DIRECTORY_PAGE_SIZE = 9
-MEMBER_IMAGE_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
 @st.cache_data(ttl=MEMBER_DIRECTORY_CACHE_TTL_SECONDS, show_spinner=False)
 def load_member_directory_cached(term: int | None = None) -> List[Dict[str, Any]]:
     return fetch_member_directory(get_client(), term=term)
-
-
-@st.cache_data(ttl=MEMBER_IMAGE_CACHE_TTL_SECONDS, show_spinner=False)
-def load_member_image_data_uri(image_url: str) -> str:
-    if not image_url:
-        return ""
-    response = requests.get(image_url, timeout=5)
-    response.raise_for_status()
-    content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
-    if not content_type.startswith("image/"):
-        content_type = "image/jpeg"
-    encoded = base64.b64encode(response.content).decode("ascii")
-    return f"data:{content_type};base64,{encoded}"
 
 
 def as_dataframe(rows: Iterable[Dict[str, Any]], columns: List[str] | None = None) -> pd.DataFrame:
@@ -237,16 +221,9 @@ def render_member_card(member: Dict[str, Any], *, key_prefix: str) -> None:
     committee = html.escape(str(member.get("committee") or "위원회 미확인"))
     term_label = html.escape(str(member.get("term_label") or "대수 미확인"))
     reelection = html.escape(str(member.get("reelection") or "선수 미확인"))
-    image_url = str(member.get("image_url") or "").strip()
-    image_src = ""
-    if image_url:
-        try:
-            image_src = load_member_image_data_uri(image_url)
-        except Exception:
-            image_src = image_url
-    image_src = html.escape(image_src)
+    image_src = html.escape(str(member.get("image_url") or "").strip())
     image_html = (
-        f"<img class='member-card__image' src='{image_src}' alt='{name} 의원 사진'>"
+        f"<img class='member-card__image' src='{image_src}' alt='{name} 의원 사진' loading='lazy' decoding='async' data-member-key='{html.escape(member_key)}'>"
         if image_src
         else f"<div class='member-card__placeholder'>{name[:1]}</div>"
     )
@@ -296,9 +273,13 @@ def render_member_directory_panel(*, key_prefix: str = "member_directory") -> No
         st.info("조회된 의원 목록이 없습니다.")
         return
 
-    term_options = ["전체"] + [f"{term}대" for term in MEMBER_DIRECTORY_TERMS]
+    available_terms = [term for term in MEMBER_DIRECTORY_TERMS if 2 <= int(term) <= 22]
+    term_options = ["전체"] + [f"{term}대" for term in available_terms]
     default_term_index = term_options.index(f"{DEFAULT_MEMBER_DIRECTORY_TERM}대")
-    selected_term_label = st.selectbox("대수", term_options, index=default_term_index, key=f"{key_prefix}_term")
+    term_key = f"{key_prefix}_term"
+    if st.session_state.get(term_key) not in term_options:
+        st.session_state[term_key] = f"{DEFAULT_MEMBER_DIRECTORY_TERM}대"
+    selected_term_label = st.selectbox("대수", term_options, index=default_term_index, key=term_key)
     st.caption("2대 ~ 22대 의원 목록 조회가 가능합니다.")
     selected_term = None if selected_term_label == "전체" else int(str(selected_term_label).replace("대", ""))
     members = [
