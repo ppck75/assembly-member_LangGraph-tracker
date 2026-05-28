@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import io
 import json
@@ -8,6 +9,7 @@ import re
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -49,11 +51,25 @@ APP_VOTE_DETAIL_SLIDER_MAX = 1000
 APP_PARTY_ALIGNMENT_SLIDER_MAX = 500
 MEMBER_DIRECTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 MEMBER_DIRECTORY_PAGE_SIZE = 9
+MEMBER_IMAGE_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
 @st.cache_data(ttl=MEMBER_DIRECTORY_CACHE_TTL_SECONDS, show_spinner=False)
 def load_member_directory_cached(term: int | None = None) -> List[Dict[str, Any]]:
     return fetch_member_directory(get_client(), term=term)
+
+
+@st.cache_data(ttl=MEMBER_IMAGE_CACHE_TTL_SECONDS, show_spinner=False)
+def load_member_image_data_uri(image_url: str) -> str:
+    if not image_url:
+        return ""
+    response = requests.get(image_url, timeout=5)
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
+    if not content_type.startswith("image/"):
+        content_type = "image/jpeg"
+    encoded = base64.b64encode(response.content).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
 
 
 def as_dataframe(rows: Iterable[Dict[str, Any]], columns: List[str] | None = None) -> pd.DataFrame:
@@ -89,8 +105,10 @@ def render_dataframe(
     )
 
 
-def select_directory_member(member_name: str) -> None:
+def select_directory_member(member_name: str, member_key: str) -> None:
     st.session_state["member_name_input"] = member_name
+    st.session_state["selected_directory_member"] = member_name
+    st.session_state["selected_directory_member_key"] = member_key
 
 
 def render_member_directory_styles() -> None:
@@ -105,6 +123,26 @@ def render_member_directory_styles() -> None:
             background:
                 linear-gradient(145deg, rgba(255,255,255,0.96), rgba(244,248,252,0.92));
             box-shadow: 0 8px 24px rgba(34, 56, 84, 0.08);
+        }
+        .member-card--selected {
+            border-color: #5091f1;
+            background:
+                linear-gradient(145deg, rgba(239,246,255,0.98), rgba(248,251,255,0.94));
+            box-shadow: 0 8px 24px rgba(34, 56, 84, 0.08);
+        }
+        .member-card__badge {
+            display: inline-block;
+            margin-bottom: 8px;
+            padding: 4px 9px;
+            border-radius: 999px;
+            background: rgba(80, 145, 241, 0.14);
+            color: #2563eb;
+            font-size: 0.78rem;
+            font-weight: 800;
+        }
+        .member-card__badge-spacer {
+            height: 30px;
+            margin-bottom: 8px;
         }
         .member-card__top {
             display: flex;
@@ -188,22 +226,37 @@ def show_member_directory(key_prefix: str = "member_directory") -> None:
 
 
 def render_member_card(member: Dict[str, Any], *, key_prefix: str) -> None:
+    selected_name = str(st.session_state.get("selected_directory_member") or "")
+    selected_key = str(st.session_state.get("selected_directory_member_key") or "")
+    member_name = str(member.get("name") or "")
+    member_key = str(member.get("_key") or member_name)
+    is_selected = bool(member_key and selected_key == member_key) or bool(not selected_key and member_name and selected_name == member_name)
     name = html.escape(str(member.get("name") or "이름 미확인"))
     party = html.escape(str(member.get("party") or "정당 미확인"))
     region = html.escape(str(member.get("region") or "지역 미확인"))
     committee = html.escape(str(member.get("committee") or "위원회 미확인"))
     term_label = html.escape(str(member.get("term_label") or "대수 미확인"))
     reelection = html.escape(str(member.get("reelection") or "선수 미확인"))
-    image_url = html.escape(str(member.get("image_url") or ""))
+    image_url = str(member.get("image_url") or "").strip()
+    image_src = ""
+    if image_url:
+        try:
+            image_src = load_member_image_data_uri(image_url)
+        except Exception:
+            image_src = image_url
+    image_src = html.escape(image_src)
     image_html = (
-        f"<img class='member-card__image' src='{image_url}' alt='{name} 의원 사진'>"
-        if image_url
+        f"<img class='member-card__image' src='{image_src}' alt='{name} 의원 사진'>"
+        if image_src
         else f"<div class='member-card__placeholder'>{name[:1]}</div>"
     )
+    card_class = "member-card member-card--selected" if is_selected else "member-card"
+    selected_badge = "<div class='member-card__badge'>현재 선택</div>" if is_selected else "<div class='member-card__badge-spacer'></div>"
 
     st.markdown(
         f"""
-        <div class="member-card">
+        <div class="{card_class}">
+            {selected_badge}
             <div class="member-card__top">
                 {image_html}
                 <div>
@@ -220,11 +273,12 @@ def render_member_card(member: Dict[str, Any], *, key_prefix: str) -> None:
         unsafe_allow_html=True,
     )
     st.button(
-        f"{member.get('name', '의원')} 선택",
-        key=f"{key_prefix}_{member.get('_key', member.get('name', 'unknown'))}",
+        "선택됨" if is_selected else f"{member.get('name', '의원')} 선택",
+        key=f"{key_prefix}_{member_key}",
+        disabled=is_selected,
         use_container_width=True,
         on_click=select_directory_member,
-        args=(str(member.get("name") or ""),),
+        args=(member_name, member_key),
     )
 
 
@@ -256,6 +310,10 @@ def render_member_directory_panel(*, key_prefix: str = "member_directory") -> No
     if not members:
         st.info("선택한 대수에 해당하는 의원이 없습니다.")
         return
+
+    selected_name = str(st.session_state.get("selected_directory_member") or "").strip()
+    if selected_name:
+        st.success(f"{selected_name} 의원이 선택되었습니다. 왼쪽 사이드바에서 분석 시작을 누르세요.")
 
     parties = sorted({str(member.get("party")) for member in members if member.get("party")})
     regions = sorted({str(member.get("region_bucket")) for member in members if member.get("region_bucket")})
@@ -1093,6 +1151,9 @@ with st.sidebar:
     st.header("조회 설정")
     member_name = st.text_input("국회의원 이름", key="member_name_input")
     st.caption("의원 목록 조회 카드에서 의원을 선택하거나, 직접 입력하여 분석을 시작하세요.")
+    selected_directory_member = str(st.session_state.get("selected_directory_member") or "").strip()
+    if selected_directory_member:
+        st.caption(f"현재 선택: {selected_directory_member} 의원")
     st.divider()
     st.subheader("분석 옵션")
     bills_enabled = st.checkbox(

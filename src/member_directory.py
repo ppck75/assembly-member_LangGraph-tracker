@@ -7,7 +7,7 @@ from .member_activity_workflow import AssemblyAPIClient, ENDPOINT_MEMBERS, norma
 
 
 DEFAULT_MEMBER_DIRECTORY_TERM = 22
-MEMBER_DIRECTORY_TERMS = list(range(22, 0, -1))
+MEMBER_DIRECTORY_TERMS = list(range(22, 1, -1))
 
 
 def _split_latest(value: Any) -> str:
