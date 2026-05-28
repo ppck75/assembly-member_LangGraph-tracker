@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import io
 import json
+import math
 import os
 import re
 from typing import Any, Dict, Iterable, List
@@ -56,6 +57,27 @@ def load_member_directory_cached(term: int | None = None) -> List[Dict[str, Any]
     return fetch_member_directory(get_client(), term=term)
 
 
+def build_member_party_lookup_from_directory(members: Iterable[Dict[str, Any]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for member in members:
+        name = str(member.get("name") or "").strip()
+        party = str(member.get("party") or "").strip()
+        terms = [int(term) for term in member.get("terms", []) if str(term).isdigit()]
+        if not name or not party:
+            continue
+        existing = lookup.get(name)
+        if not existing or DEFAULT_MEMBER_DIRECTORY_TERM in terms:
+            lookup[name] = party
+    return lookup
+
+
+def get_member_party_lookup_cached() -> Dict[str, str]:
+    try:
+        return build_member_party_lookup_from_directory(load_member_directory_cached(None))
+    except Exception:
+        return {}
+
+
 def as_dataframe(rows: Iterable[Dict[str, Any]], columns: List[str] | None = None) -> pd.DataFrame:
     df = pd.DataFrame(list(rows or []))
     if df.empty:
@@ -89,7 +111,12 @@ def render_dataframe(
     )
 
 
-def select_directory_member(member_name: str, member_key: str) -> None:
+def toggle_directory_member(member_name: str, member_key: str) -> None:
+    if st.session_state.get("selected_directory_member_key") == member_key:
+        st.session_state["member_name_input"] = ""
+        st.session_state.pop("selected_directory_member", None)
+        st.session_state.pop("selected_directory_member_key", None)
+        return
     st.session_state["member_name_input"] = member_name
     st.session_state["selected_directory_member"] = member_name
     st.session_state["selected_directory_member_key"] = member_key
@@ -100,13 +127,15 @@ def render_member_directory_styles() -> None:
         """
         <style>
         .member-card {
-            min-height: 282px;
+            height: 324px;
             padding: 16px;
             border: 1px solid #dbe4ee;
             border-radius: 18px;
             background:
                 linear-gradient(145deg, rgba(255,255,255,0.96), rgba(244,248,252,0.92));
             box-shadow: 0 8px 24px rgba(34, 56, 84, 0.08);
+            box-sizing: border-box;
+            overflow: hidden;
         }
         .member-card--selected {
             border-color: #5091f1;
@@ -175,12 +204,24 @@ def render_member_directory_styles() -> None:
             color: #4d5b6d;
             font-size: 0.92rem;
             line-height: 1.42;
+            display: grid;
+            grid-template-columns: 56px minmax(0, 1fr);
+            gap: 8px;
+            align-items: start;
         }
         .member-card__label {
-            display: inline-block;
-            min-width: 54px;
             color: #8190a3;
             font-weight: 700;
+        }
+        .member-card__value {
+            min-width: 0;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+        }
+        .member-card__value--committee {
+            -webkit-line-clamp: 2;
         }
         </style>
         """,
@@ -241,20 +282,19 @@ def render_member_card(member: Dict[str, Any], *, key_prefix: str) -> None:
                     <span class="member-card__party">{party}</span>
                 </div>
             </div>
-            <div class="member-card__row"><span class="member-card__label">지역</span>{region}</div>
-            <div class="member-card__row"><span class="member-card__label">위원회</span>{committee}</div>
-            <div class="member-card__row"><span class="member-card__label">대수</span>{term_label}</div>
-            <div class="member-card__row"><span class="member-card__label">선수</span>{reelection}</div>
+            <div class="member-card__row"><span class="member-card__label">지역</span><span class="member-card__value" title="{region}">{region}</span></div>
+            <div class="member-card__row"><span class="member-card__label">위원회</span><span class="member-card__value member-card__value--committee" title="{committee}">{committee}</span></div>
+            <div class="member-card__row"><span class="member-card__label">대수</span><span class="member-card__value" title="{term_label}">{term_label}</span></div>
+            <div class="member-card__row"><span class="member-card__label">선수</span><span class="member-card__value" title="{reelection}">{reelection}</span></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.button(
-        "선택됨" if is_selected else f"{member.get('name', '의원')} 선택",
+        "선택 해제" if is_selected else f"{member.get('name', '의원')} 선택",
         key=f"{key_prefix}_{member_key}",
-        disabled=is_selected,
         use_container_width=True,
-        on_click=select_directory_member,
+        on_click=toggle_directory_member,
         args=(member_name, member_key),
     )
 
@@ -496,6 +536,7 @@ def build_initial_state(member_name: str, options: Dict[str, Any]) -> Dict[str, 
         "recent_news_enabled": options["recent_news_enabled"],
         "enable_cosponsor_scan": options["enable_cosponsor_scan"],
         "max_cosponsor_scan_pages": options["max_cosponsor_scan_pages"],
+        "member_party_lookup": options.get("member_party_lookup", {}),
         "show_progress": False,
     }
 
@@ -505,10 +546,12 @@ WORKFLOW_STEPS = [
     ("get_member_info", "의원 기본정보 조회", "재임 대수, 정당, 선거구, 위원회 정보를 확인합니다."),
     ("search_member_bills", "발의법안 조회", "대표발의와 공동발의 법안을 수집합니다."),
     ("analyze_legislative_interests", "입법 관심 분야 분석", "발의법안 통계를 바탕으로 관심 의제를 요약합니다."),
+    ("analyze_cosponsor_network", "공동발의 네트워크 분석", "반복 공동발의 파트너와 협업 분야를 계산합니다."),
     ("get_all_member_votes", "표결 상세 조회", "본회의 표결 기록을 조회하고 찬성·반대·기권·불참으로 분류합니다."),
     ("analyze_party_alignment", "정당 다수 입장 일치도 분석", "같은 정당 의원 다수 입장과의 일치 여부를 계산합니다."),
     ("interpret_vote_statistics", "표결 해석 메모 생성", "분석 범위와 불참 비중을 고려한 해석 주의사항을 만듭니다."),
     ("search_recent_member_news", "최근 이슈 검색", "최근 뉴스 검색 결과를 바탕으로 공개 이슈를 요약합니다."),
+    ("generate_activity_briefing", "핵심 브리핑 생성", "주요 활동 지표를 3~5문장으로 정리합니다."),
     ("summarize_member_activity", "최종 결과 정리", "전체 분석 결과를 화면에 표시할 형태로 정리합니다."),
 ]
 
@@ -613,6 +656,16 @@ def render_summary_scope(result: Dict[str, Any]) -> None:
     st.markdown("\n".join(lines))
 
 
+def render_activity_briefing(result: Dict[str, Any]) -> None:
+    briefing = str(result.get("activity_briefing") or "").strip()
+    if not briefing:
+        return
+    with st.container(border=True):
+        st.markdown("#### 핵심 브리핑")
+        st.caption("발의법안, 표결, 정당 일치도, 최근 뉴스 수를 바탕으로 한 요약입니다.")
+        st.markdown(briefing)
+
+
 def render_bill_summary_charts(result: Dict[str, Any]) -> None:
     rep_count = len(result.get("representative_bills", []))
     co_count = len(result.get("cosponsored_bills", []))
@@ -675,6 +728,273 @@ def render_bill_summary_charts(result: Dict[str, Any]) -> None:
         else:
             st.subheader("소관위원회별 발의법안")
             st.info("소관위원회 통계가 없습니다.")
+
+
+def render_cosponsor_network_graph(result: Dict[str, Any], partners_override: List[Dict[str, Any]] | None = None) -> None:
+    context = result.get("cosponsor_network_context", {})
+    partners = list(partners_override if partners_override is not None else result.get("cosponsor_network_partners", []) or [])[:30]
+    member_name = str(context.get("member_name") or result.get("member_name") or "대상 의원")
+    if not partners:
+        st.info("공동발의 네트워크를 구성할 파트너 데이터가 없습니다.")
+        return
+
+    max_count = max(as_int(partner.get("공동발의건수")) for partner in partners) or 1
+
+    def partner_node_size(count: int) -> int:
+        # Square-root scaling keeps large collaborators visible without letting one node dominate.
+        scaled = (max(count, 1) / max_count) ** 0.5
+        return int(round(14 + scaled * 20))
+
+    def edge_width(count: int) -> float:
+        scaled = (max(count, 1) / max_count) ** 0.5
+        return round(1.2 + scaled * 5.2, 2)
+
+    nodes = [
+        {
+            "id": "center",
+            "label": member_name,
+            "title": f"{member_name} 의원",
+            "shape": "dot",
+            "size": 34,
+            "x": 0,
+            "y": 0,
+            "fixed": {"x": True, "y": True},
+            "color": {"background": "#5091f1", "border": "#2563eb"},
+            "font": {"size": 18, "color": "#1e344d", "bold": True},
+        }
+    ]
+    edges = []
+    for index, partner in enumerate(partners):
+        count = as_int(partner.get("공동발의건수"))
+        partner_name = str(partner.get("공동발의자") or f"파트너 {index + 1}")
+        party_relation = str(partner.get("정당관계") or "정당 미확인")
+        partner_id = f"partner_{index}"
+        angle = (2 * math.pi * index) / max(len(partners), 1)
+        radius = 210 if len(partners) <= 18 else 250
+        if len(partners) > 24 and index % 2:
+            radius = 175
+        if party_relation == "당내":
+            color = {"background": "#30be8e", "border": "#19946b"}
+        elif party_relation == "당외":
+            color = {"background": "#ffb22c", "border": "#d28b13"}
+        else:
+            color = {"background": "#a66fec", "border": "#7c3fc9"}
+        nodes.append(
+            {
+                "id": partner_id,
+                "label": f"{partner_name}\n{count}건",
+                "title": f"{partner_name}<br>정당: {partner.get('정당', '정당 미확인')} ({party_relation})<br>{partner.get('주요소관위원회', '')}<br>최근: {partner.get('최근공동발의일', '')}",
+                "shape": "dot",
+                "size": partner_node_size(count),
+                "x": round(math.cos(angle) * radius, 2),
+                "y": round(math.sin(angle) * radius, 2),
+                "fixed": {"x": True, "y": True},
+                "color": color,
+                "font": {"size": 13, "color": "#334155"},
+            }
+        )
+        edges.append(
+            {
+                "from": "center",
+                "to": partner_id,
+                "value": max(1, count),
+                "width": edge_width(count),
+                "title": f"공동발의 {count}건",
+                "color": {"color": "rgba(80, 145, 241, 0.42)"},
+            }
+        )
+
+    nodes_json = json.dumps(nodes, ensure_ascii=False)
+    edges_json = json.dumps(edges, ensure_ascii=False)
+    components.html(
+        f"""
+        <div id="cosponsor-network" style="height:520px;border:1px solid #dbe4ee;border-radius:16px;background:linear-gradient(145deg,#ffffff,#f6f9fc);"></div>
+        <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.js"></script>
+        <script>
+          const container = document.getElementById('cosponsor-network');
+          if (window.vis) {{
+            const data = {{
+              nodes: new vis.DataSet({nodes_json}),
+              edges: new vis.DataSet({edges_json})
+            }};
+            const options = {{
+              autoResize: true,
+              interaction: {{ hover: true, tooltipDelay: 120 }},
+              nodes: {{ physics: false }},
+              physics: false,
+              layout: {{ improvedLayout: false }},
+              edges: {{ smooth: {{ type: 'continuous' }} }}
+            }};
+            const network = new vis.Network(container, data, options);
+            const centerNetwork = () => {{
+              const width = Math.max(container.clientWidth || 0, 320);
+              const height = Math.max(container.clientHeight || 0, 360);
+              const nodes = data.nodes.get();
+              const maxExtent = nodes.reduce((value, node) => {{
+                const nodeSize = Number(node.size || 20);
+                const extent = Math.max(Math.abs(Number(node.x || 0)), Math.abs(Number(node.y || 0))) + nodeSize * 2.2;
+                return Math.max(value, extent);
+              }}, 260);
+              const scale = Math.max(0.5, Math.min(1.2, Math.min((width - 80) / (maxExtent * 2), (height - 70) / (maxExtent * 2))));
+              network.moveTo({{ position: {{ x: 0, y: 0 }}, scale, animation: false }});
+              network.redraw();
+            }};
+            requestAnimationFrame(centerNetwork);
+            network.once('afterDrawing', centerNetwork);
+            setTimeout(centerNetwork, 80);
+            setTimeout(centerNetwork, 250);
+            setTimeout(centerNetwork, 700);
+            if (window.ResizeObserver) {{
+              new ResizeObserver(centerNetwork).observe(container);
+            }}
+          }} else {{
+            container.innerHTML = '<div style="padding:16px;color:#666;">네트워크 라이브러리를 불러오지 못했습니다.</div>';
+          }}
+        </script>
+        """,
+        height=545,
+    )
+
+
+def render_cosponsor_network_section(result: Dict[str, Any]) -> None:
+    partners = list(result.get("cosponsor_network_partners", []) or [])
+    committees = list(result.get("cosponsor_network_committees", []) or [])
+    summary = result.get("cosponsor_network_summary", {}) or {}
+    analysis = str(result.get("cosponsor_network_analysis") or "").strip()
+
+    st.subheader("공동발의 네트워크")
+    st.caption("대상 의원을 중심으로 같은 법안에 함께 이름이 등장한 공동발의 파트너를 연결한 1차 ego-network입니다.")
+    if not partners:
+        st.info("공동발의 네트워크 데이터가 없습니다. 발의법안 조회 범위가 좁거나 공동발의자 문자열을 확인할 수 없는 경우입니다.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("협업 파트너", f"{as_int(summary.get('협업파트너')):,}명")
+    c2.metric("협업 연결", f"{as_int(summary.get('협업연결')):,}건")
+    c3.metric("상위 3명 집중도", f"{float(summary.get('상위3명집중도') or 0):.1f}%")
+    c4.metric("협업 유형", str(summary.get("협업유형") or "-"))
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("당내 협업", f"{float(summary.get('당내협업비율') or 0):.1f}%")
+    b2.metric("당외 협업", f"{float(summary.get('당외협업비율') or 0):.1f}%")
+    b3.metric("정당 미확인", f"{float(summary.get('정당미확인비율') or 0):.1f}%")
+    b4.metric("초당성 유형", str(summary.get("초당협업유형") or "-"))
+
+    if analysis:
+        with st.container(border=True):
+            st.markdown("#### 협업 유형 해석")
+            st.markdown(analysis)
+
+    party_data = [
+        {"name": "당내", "value": as_int(summary.get("당내협업"))},
+        {"name": "당외", "value": as_int(summary.get("당외협업"))},
+        {"name": "정당 미확인", "value": as_int(summary.get("정당미확인협업"))},
+    ]
+    left_chart, right_note = st.columns([0.55, 0.45])
+    with left_chart:
+        if chart_has_data(party_data):
+            option = base_chart_option()
+            option["color"] = ["rgba(48, 190, 142, 0.82)", "rgba(255, 178, 44, 0.82)", "rgba(166, 111, 236, 0.78)"]
+            option.update(
+                {
+                    "series": [
+                        {
+                            "type": "pie",
+                            "radius": ["48%", "72%"],
+                            "center": ["50%", "45%"],
+                            "label": {"formatter": "{b}\n{c}건", "color": "#56616f"},
+                            "itemStyle": {"borderColor": "#ffffff", "borderWidth": 2},
+                            "data": party_data,
+                        }
+                    ]
+                }
+            )
+            render_echarts("정당 내/외 협업 비중", option, height=300)
+    with right_note:
+        st.info(
+            "정당 색상 기준: 초록은 당내, 주황은 당외, 보라는 정당 미확인입니다. "
+            "정당 매칭은 의원 목록 API의 현재/최근 정당명을 기준으로 하므로 발의 당시 정당과 다를 수 있습니다."
+        )
+
+    committee_options = ["전체"] + [str(row.get("소관위원회")) for row in committees if row.get("소관위원회")]
+    selected_committee = st.selectbox(
+        "소관위원회별 네트워크 필터",
+        committee_options,
+        key="cosponsor_network_committee_filter",
+        help="선택한 소관위원회에서 함께 발의한 파트너만 네트워크에 표시합니다.",
+    )
+    filtered_partners = partners
+    if selected_committee != "전체":
+        filtered_partners = []
+        for partner in partners:
+            filtered_bills = [bill for bill in partner.get("함께한법안", []) if bill.get("소관위원회") == selected_committee]
+            if not filtered_bills:
+                continue
+            filtered_partner = dict(partner)
+            filtered_partner["공동발의건수"] = len(filtered_bills)
+            filtered_partner["함께한법안"] = filtered_bills
+            filtered_partner["주요소관위원회"] = f"{selected_committee} {len(filtered_bills)}건"
+            filtered_partners.append(filtered_partner)
+        filtered_partners = sorted(filtered_partners, key=lambda row: (-as_int(row.get("공동발의건수")), str(row.get("공동발의자") or "")))
+    st.caption(f"네트워크 시각화는 렌더링 속도를 위해 현재 조건의 상위 {min(30, len(filtered_partners))}명까지만 표시합니다.")
+    render_cosponsor_network_graph(result, filtered_partners)
+
+    top_partners = partners[:10]
+    if top_partners:
+        option = base_chart_option()
+        axis = chart_axis_style(option)
+        option.update(
+            {
+                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                "grid": {"left": 70, "right": 20, "top": 30, "bottom": 80},
+                "xAxis": {"type": "category", "data": [row.get("공동발의자") for row in top_partners], **axis},
+                "yAxis": {"type": "value", "name": "공동발의 건수", **axis},
+                "series": [
+                    {
+                        "name": "공동발의",
+                        "type": "bar",
+                        "data": [as_int(row.get("공동발의건수")) for row in top_partners],
+                        "itemStyle": {"borderRadius": [8, 8, 0, 0]},
+                    }
+                ],
+            }
+        )
+        render_echarts("반복 협업 의원 Top 10", option, height=330)
+
+    table_rows = [
+        {
+            "공동발의자": row.get("공동발의자"),
+            "정당": row.get("정당"),
+            "정당관계": row.get("정당관계"),
+            "공동발의건수": row.get("공동발의건수"),
+            "주요소관위원회": row.get("주요소관위원회"),
+            "최근공동발의일": row.get("최근공동발의일"),
+            "대표법안": row.get("대표법안"),
+        }
+        for row in top_partners
+    ]
+    left, right = st.columns([1.25, 0.75])
+    with left:
+        render_dataframe("반복 협업 의원", table_rows, ["공동발의자", "정당", "정당관계", "공동발의건수", "주요소관위원회", "최근공동발의일", "대표법안"], height=320)
+    with right:
+        render_dataframe("협업 소관위원회", committees[:10], ["소관위원회", "협업건수"], height=320)
+
+    partner_names = [str(row.get("공동발의자")) for row in partners if row.get("공동발의자")]
+    if partner_names:
+        selected_partner_name = st.selectbox("파트너 상세 보기", partner_names[:30], key="cosponsor_partner_detail")
+        selected_partner = next((row for row in partners if row.get("공동발의자") == selected_partner_name), None)
+        if selected_partner:
+            st.markdown(
+                f"**{selected_partner_name}** · {selected_partner.get('정당', '정당 미확인')} · "
+                f"{selected_partner.get('공동발의건수', 0)}건"
+            )
+            render_dataframe(
+                "함께 발의한 법안",
+                selected_partner.get("함께한법안", []),
+                ["법안명", "발의일", "소관위원회", "대상역할", "링크"],
+                height=280,
+            )
+
+    st.caption("주의: 공동발의는 정책 공조, 입장 표명, 의례적 참여가 섞일 수 있으므로 실제 정치적 연대나 정책 동의로 단정하지 않습니다.")
 
 
 def render_vote_summary_chart(result: Dict[str, Any]) -> None:
@@ -879,6 +1199,7 @@ def render_news_table_timeline(result: Dict[str, Any]) -> None:
 
 def render_summary_tab(result: Dict[str, Any]) -> None:
     render_summary_kpis(result)
+    render_activity_briefing(result)
     st.divider()
 
     st.subheader("의원 프로필")
@@ -913,6 +1234,8 @@ def render_bills_tab(result: Dict[str, Any]) -> None:
     c2.metric("대표발의", f"{len(rep):,}건")
     c3.metric("공동발의", f"{len(co):,}건")
     render_bill_summary_charts(result)
+    st.divider()
+    render_cosponsor_network_section(result)
     st.divider()
 
     stat_cols = ["처리결과", "건수"]
@@ -1223,6 +1546,7 @@ options = {
     "party_alignment_enabled": bool(party_alignment_enabled),
     "llm_insights_enabled": bool(llm_insights_enabled),
     "recent_news_enabled": bool(recent_news_enabled),
+    "member_party_lookup": get_member_party_lookup_cached(),
 }
 
 if run_button:

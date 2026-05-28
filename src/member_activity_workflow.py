@@ -28,7 +28,7 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v12_vote_fallback"
+WORKFLOW_VERSION = "member_activity_v16_cosponsor_party_layout_fix"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
@@ -81,6 +81,7 @@ class MemberActivityState(TypedDict, total=False):
     llm_insights_enabled: bool
     recent_news_enabled: bool
     max_cosponsor_scan_pages: int
+    member_party_lookup: Dict[str, str]
     enable_cosponsor_scan: bool
     show_progress: bool
     progress_callback: Any
@@ -94,6 +95,12 @@ class MemberActivityState(TypedDict, total=False):
     legislative_interest_context: Dict[str, Any]
     legislative_interest_analysis: str
     legislative_interest_analysis_source: str
+    cosponsor_network_context: Dict[str, Any]
+    cosponsor_network_analysis: str
+    cosponsor_network_analysis_source: str
+    cosponsor_network_partners: List[Dict[str, Any]]
+    cosponsor_network_committees: List[Dict[str, Any]]
+    cosponsor_network_summary: Dict[str, Any]
     recent_news_query: str
     recent_news_items: List[Dict[str, Any]]
     recent_news_analysis: str
@@ -113,6 +120,9 @@ class MemberActivityState(TypedDict, total=False):
     vote_interpretation_context: Dict[str, Any]
     vote_interpretation_analysis: str
     vote_interpretation_analysis_source: str
+    activity_briefing_context: Dict[str, Any]
+    activity_briefing: str
+    activity_briefing_source: str
     profile_summary: str
     summary: str
     errors: List[str]
@@ -176,6 +186,18 @@ def member_code_from_row(record: Dict[str, Any]) -> str:
 
 def party_name_from_row(record: Dict[str, Any]) -> str:
     return first_present(record, ["POLY_NM", "PLPT_NM", "PARTY_NM", "POLY_NM_REAL"])
+
+
+def normalize_party_name(value: Any) -> str:
+    text = normalize_space(value)
+    if not text:
+        return ""
+    parts = [normalize_space(part) for part in re.split(r"\s*/\s*", text) if normalize_space(part)]
+    text = parts[-1] if parts else text
+    text = re.sub(r"\s+", "", text)
+    if text in {"정당미확인", "미확인", "정보없음", "없음", "-"}:
+        return ""
+    return normalize_space(text)
 
 
 def district_name_from_row(record: Dict[str, Any]) -> str:
@@ -498,6 +520,43 @@ def split_multi_value(value: Any) -> List[str]:
         if item and item not in seen:
             seen.append(item)
     return seen
+
+
+def clean_lawmaker_name(value: Any) -> str:
+    text = normalize_space(value)
+    if not text:
+        return ""
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"\b\d+\s*인\b", "", text)
+    text = re.sub(r"(국회의원|의원|대표발의|공동발의|발의자|찬성자|소개의원)$", "", text)
+    text = re.sub(r"\s*(등|외)\s*\d*\s*인?$", "", text)
+    text = re.sub(r"[^가-힣A-Za-z·ㆍ\s]", " ", text)
+    text = normalize_space(text.replace("ㆍ", " ").replace("·", " "))
+    if len(text) < 2 or text in {"등", "외", "인"}:
+        return ""
+    return text
+
+
+def parse_lawmaker_names(value: Any) -> List[str]:
+    text = normalize_space(value)
+    if not text:
+        return []
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = text.replace("ㆍ", ",").replace("·", ",").replace("/", ",").replace("，", ",")
+    raw_parts = re.split(r"\s*,\s*|\s+및\s+|\s+와\s+|\s+과\s+", text)
+    names: List[str] = []
+    for part in raw_parts:
+        name = clean_lawmaker_name(part)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def names_contain_member(names: List[str], member_name: str) -> bool:
+    target = clean_lawmaker_name(member_name)
+    if not target:
+        return False
+    return any(name == target or target in name or name in target for name in names)
 
 
 def compact_list_text(items: List[str], limit: int = 5) -> str:
@@ -931,6 +990,374 @@ def analyze_legislative_interests_node(state: MemberActivityState) -> MemberActi
             "legislative_interest_context": context,
             "legislative_interest_analysis": analysis,
             "legislative_interest_analysis_source": "rule_fallback_after_error",
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)) or quota_exhausted,
+        }
+
+
+def build_cosponsor_network_context(state: MemberActivityState) -> Dict[str, Any]:
+    member_name = clean_lawmaker_name(state.get("member_name"))
+    bills = state.get("sponsored_bills", [])
+    party_lookup = {
+        clean_lawmaker_name(name): normalize_party_name(party)
+        for name, party in dict(state.get("member_party_lookup", {}) or {}).items()
+        if clean_lawmaker_name(name) and normalize_party_name(party)
+    }
+    member_party = (
+        normalize_party_name(state.get("member_party"))
+        or party_lookup.get(member_name, "")
+        or normalize_party_name(member_party_for_news_query(state))
+    )
+    partner_stats: Dict[str, Dict[str, Any]] = {}
+    committee_counts: Dict[str, int] = {}
+    total_links = 0
+    representative_link_count = 0
+    cosponsored_link_count = 0
+    same_party_links = 0
+    cross_party_links = 0
+    unknown_party_links = 0
+
+    for bill in bills:
+        representative_names = parse_lawmaker_names(bill.get("RST_PROPOSER"))
+        cosponsor_names = parse_lawmaker_names(bill.get("PUBL_PROPOSER"))
+        role = normalize_space(bill.get("_ROLE")) or classify_bill_role(bill, member_name)
+        target_is_representative = names_contain_member(representative_names, member_name) or role == "대표발의"
+        target_is_cosponsor = names_contain_member(cosponsor_names, member_name) or role == "공동발의"
+        if not target_is_representative and not target_is_cosponsor:
+            continue
+
+        partners: List[str] = []
+        if target_is_representative:
+            partners.extend(cosponsor_names)
+        if target_is_cosponsor:
+            partners.extend(representative_names)
+            partners.extend(cosponsor_names)
+
+        cleaned_partners: List[str] = []
+        for partner in partners:
+            partner_name = clean_lawmaker_name(partner)
+            if not partner_name or names_contain_member([partner_name], member_name):
+                continue
+            if partner_name not in cleaned_partners:
+                cleaned_partners.append(partner_name)
+
+        if not cleaned_partners:
+            continue
+
+        committee = normalize_space(bill.get("COMMITTEE")) or "미확인"
+        bill_date = normalize_space(bill.get("PROPOSE_DT") or bill.get("PPSL_DT"))
+        bill_name = normalize_space(bill.get("BILL_NAME")) or "법안명 미확인"
+        bill_link = normalize_space(bill.get("DETAIL_LINK"))
+        committee_counts[committee] = committee_counts.get(committee, 0) + len(cleaned_partners)
+
+        for partner_name in cleaned_partners:
+            total_links += 1
+            if target_is_representative:
+                representative_link_count += 1
+            elif target_is_cosponsor:
+                cosponsored_link_count += 1
+            stat = partner_stats.setdefault(
+                partner_name,
+                {
+                    "공동발의자": partner_name,
+                    "정당": party_lookup.get(partner_name, "정당 미확인"),
+                    "공동발의건수": 0,
+                    "당내협업": 0,
+                    "당외협업": 0,
+                    "정당미확인협업": 0,
+                    "소관위원회별": {},
+                    "최근공동발의일": "",
+                    "대표법안": "",
+                    "함께한법안": [],
+                },
+            )
+            partner_party = normalize_party_name(stat.get("정당")) or "정당 미확인"
+            stat["공동발의건수"] += 1
+            if not member_party or partner_party in {"", "정당 미확인"}:
+                stat["정당미확인협업"] += 1
+                unknown_party_links += 1
+                party_relation = "미확인"
+            elif partner_party == member_party:
+                stat["당내협업"] += 1
+                same_party_links += 1
+                party_relation = "당내"
+            else:
+                stat["당외협업"] += 1
+                cross_party_links += 1
+                party_relation = "당외"
+            stat["정당관계"] = party_relation if stat["공동발의건수"] == 1 else stat.get("정당관계", party_relation)
+            stat["소관위원회별"][committee] = stat["소관위원회별"].get(committee, 0) + 1
+            if not stat["최근공동발의일"] or (bill_date and bill_date > stat["최근공동발의일"]):
+                stat["최근공동발의일"] = bill_date
+                stat["대표법안"] = bill_name
+            if len(stat["함께한법안"]) < 8:
+                stat["함께한법안"].append(
+                    {
+                        "법안명": bill_name,
+                        "발의일": bill_date,
+                        "소관위원회": committee,
+                        "대상역할": "대표발의" if target_is_representative else "공동발의",
+                        "링크": bill_link,
+                    }
+                )
+
+    partner_rows: List[Dict[str, Any]] = []
+    for stat in partner_stats.values():
+        committee_items = sorted(stat["소관위원회별"].items(), key=lambda item: (-item[1], item[0]))
+        partner_rows.append(
+            {
+                "공동발의자": stat["공동발의자"],
+                "정당": stat.get("정당") or "정당 미확인",
+                "정당관계": stat.get("정당관계") or "미확인",
+                "공동발의건수": stat["공동발의건수"],
+                "당내협업": stat.get("당내협업", 0),
+                "당외협업": stat.get("당외협업", 0),
+                "정당미확인협업": stat.get("정당미확인협업", 0),
+                "주요소관위원회": ", ".join(f"{name} {count}건" for name, count in committee_items[:3]) or "미확인",
+                "최근공동발의일": stat["최근공동발의일"],
+                "대표법안": stat["대표법안"],
+                "함께한법안": stat["함께한법안"],
+            }
+        )
+    partner_rows = sorted(partner_rows, key=lambda row: (-int(row.get("공동발의건수", 0)), row.get("공동발의자", "")))
+    committee_rows = counts_to_records(committee_counts, "소관위원회", "협업건수")
+    top3_links = sum(int(row.get("공동발의건수", 0) or 0) for row in partner_rows[:3])
+    concentration = round(top3_links / total_links * 100, 1) if total_links else 0.0
+    top_partner = partner_rows[0]["공동발의자"] if partner_rows else ""
+    cross_party_rate = round(cross_party_links / total_links * 100, 1) if total_links else 0.0
+    same_party_rate = round(same_party_links / total_links * 100, 1) if total_links else 0.0
+    unknown_party_rate = round(unknown_party_links / total_links * 100, 1) if total_links else 0.0
+    bipartisanship_type = classify_bipartisanship_type(cross_party_rate, total_links, unknown_party_rate)
+    network_type = classify_cosponsor_network_type(len(partner_rows), concentration, committee_rows)
+
+    return {
+        "member_name": member_name or state.get("member_name", ""),
+        "member_party": member_party or "정당 미확인",
+        "partner_count": len(partner_rows),
+        "total_links": total_links,
+        "top_partner": top_partner,
+        "top3_concentration": concentration,
+        "network_type": network_type,
+        "same_party_links": same_party_links,
+        "cross_party_links": cross_party_links,
+        "unknown_party_links": unknown_party_links,
+        "same_party_rate": same_party_rate,
+        "cross_party_rate": cross_party_rate,
+        "unknown_party_rate": unknown_party_rate,
+        "bipartisanship_type": bipartisanship_type,
+        "representative_bill_links": representative_link_count,
+        "cosponsored_bill_links": cosponsored_link_count,
+        "partners": partner_rows[:50],
+        "top_partners": partner_rows[:10],
+        "committee_stats": committee_rows[:10],
+        "data_basis": "현재 발의법안 API 응답의 대표발의자·공동발의자 문자열을 파싱해 대상 의원 중심 ego-network로 계산했습니다.",
+    }
+
+
+def classify_cosponsor_network_type(partner_count: int, top3_concentration: float, committee_rows: List[Dict[str, Any]]) -> str:
+    if partner_count == 0:
+        return "공동발의 네트워크 데이터 부족"
+    if partner_count <= 5 and top3_concentration >= 70:
+        return "소수 반복 협업형"
+    if partner_count >= 20 and top3_concentration <= 40:
+        return "분산 협업형"
+    if committee_rows:
+        total = sum(int(row.get("협업건수", 0) or 0) for row in committee_rows)
+        top = int(committee_rows[0].get("협업건수", 0) or 0)
+        if total and top / total >= 0.5:
+            return "분야 집중 협업형"
+    return "균형 협업형"
+
+
+def classify_bipartisanship_type(cross_party_rate: float, total_links: int, unknown_party_rate: float) -> str:
+    if total_links <= 0:
+        return "초당성 데이터 부족"
+    if unknown_party_rate >= 50:
+        return "정당 매칭 제한"
+    if cross_party_rate < 20:
+        return "정당 내부 협업 중심"
+    if cross_party_rate < 40:
+        return "제한적 초당 협업"
+    if cross_party_rate < 60:
+        return "혼합형 협업"
+    return "초당 협업 비중 높음"
+
+
+def fallback_cosponsor_network_analysis(context: Dict[str, Any]) -> str:
+    member_name = normalize_space(context.get("member_name")) or "해당 의원"
+    partner_count = int(context.get("partner_count", 0) or 0)
+    total_links = int(context.get("total_links", 0) or 0)
+    network_type = normalize_space(context.get("network_type")) or "유형 미확인"
+    bipartisanship_type = normalize_space(context.get("bipartisanship_type")) or "초당성 미확인"
+    concentration = float(context.get("top3_concentration", 0) or 0)
+    cross_party_rate = float(context.get("cross_party_rate", 0) or 0)
+    same_party_rate = float(context.get("same_party_rate", 0) or 0)
+    top_partners = context.get("top_partners", [])
+    committees = context.get("committee_stats", [])
+    if not partner_count:
+        return "- 공동발의자 문자열에서 반복 협업 네트워크를 구성할 충분한 데이터를 찾지 못했습니다."
+
+    lines = [
+        f"- {member_name} 의원의 공동발의 네트워크는 파트너 {partner_count:,}명, 연결 {total_links:,}건으로 구성되며 현재 조회 범위에서는 **{network_type}**으로 볼 수 있습니다.",
+        f"- 정당 매칭 기준으로는 당내 협업 {same_party_rate:.1f}%, 당외 협업 {cross_party_rate:.1f}%로 **{bipartisanship_type}**에 가깝습니다.",
+        f"- 상위 3명 파트너가 전체 협업 연결의 {concentration:.1f}%를 차지하므로, 이 비중을 통해 협업이 소수에게 집중되는지 확인할 수 있습니다.",
+    ]
+    if top_partners:
+        partner_text = ", ".join(f"{row.get('공동발의자')}({row.get('공동발의건수')}건)" for row in top_partners[:5])
+        lines.append(f"- 반복 협업 상위 파트너는 {partner_text}입니다.")
+    if committees:
+        committee_text = ", ".join(f"{row.get('소관위원회')} {row.get('협업건수')}건" for row in committees[:3])
+        lines.append(f"- 협업은 소관위원회 기준 {committee_text}에서 상대적으로 많이 나타납니다.")
+    lines.append("- 공동발의는 정책 공조, 입장 표명, 의례적 참여가 섞일 수 있으므로 실제 정치적 연대나 정책 동의로 단정하지 않아야 합니다.")
+    return "\n".join(lines)
+
+
+def generate_cosponsor_network_analysis(context: Dict[str, Any]) -> tuple[str, str]:
+    cache_key = [
+        "google",
+        "cosponsor_network_v1",
+        DEFAULT_LLM_MODEL,
+        context.get("member_name"),
+        json.dumps(
+            {
+                "partner_count": context.get("partner_count"),
+                "total_links": context.get("total_links"),
+                "top3_concentration": context.get("top3_concentration"),
+                "network_type": context.get("network_type"),
+                "member_party": context.get("member_party"),
+                "same_party_rate": context.get("same_party_rate"),
+                "cross_party_rate": context.get("cross_party_rate"),
+                "unknown_party_rate": context.get("unknown_party_rate"),
+                "bipartisanship_type": context.get("bipartisanship_type"),
+                "top_partners": context.get("top_partners", [])[:10],
+                "committee_stats": context.get("committee_stats", [])[:10],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    ]
+    cached = load_cache("cosponsor_network_analysis", cache_key)
+    if cached:
+        return str(cached), "cache"
+    google_api_key = get_google_api_key()
+    if not google_api_key or ChatGoogleGenerativeAI is None:
+        return fallback_cosponsor_network_analysis(context), "rule_fallback"
+
+    system_prompt = (
+        "당신은 국회의원 공동발의 네트워크를 해석하는 입법 데이터 분석가입니다. "
+        "제공된 통계만 근거로 협업 패턴을 설명하고, 정치적 친소관계나 실제 정책 동의를 단정하지 마세요."
+    )
+    user_prompt = f"""
+아래 JSON context를 바탕으로 공동발의 네트워크를 해석하세요.
+
+규칙:
+- 3~5개 Markdown bullet로 작성하세요.
+- 이 의원이 소수 반복 협업형, 분산 협업형, 분야 집중 협업형 중 어디에 가까운지 설명하세요.
+- 정당 내/정당 외 협업 비중을 바탕으로 초당적 협업 성격을 설명하세요.
+- 반복 협업 의원과 주요 소관위원회 분야를 근거로 언급하세요.
+- 공동발의는 강한 정책 공조로 단정할 수 없다는 주의문을 포함하세요.
+- 정당 정보는 현재/최근 의원 정보 매칭 기준이므로 발의 당시 정당과 다를 수 있다는 한계를 언급하세요.
+- 제목은 쓰지 마세요.
+
+context:
+{json.dumps(context, ensure_ascii=False, indent=2)}
+""".strip()
+    llm = ChatGoogleGenerativeAI(model=DEFAULT_LLM_MODEL, temperature=0.15)
+    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+    analysis = normalize_markdown(getattr(response, "content", ""))
+    if not analysis:
+        return fallback_cosponsor_network_analysis(context), "rule_fallback"
+    save_cache("cosponsor_network_analysis", cache_key, analysis)
+    return analysis, "llm"
+
+
+def analyze_cosponsor_network_node(state: MemberActivityState) -> MemberActivityState:
+    errors = list(state.get("errors", []))
+    context = build_cosponsor_network_context(state)
+    partners = context.get("partners", [])
+    committees = context.get("committee_stats", [])
+    summary = {
+        "협업파트너": context.get("partner_count", 0),
+        "협업연결": context.get("total_links", 0),
+        "상위3명집중도": context.get("top3_concentration", 0),
+        "협업유형": context.get("network_type", ""),
+        "최다협업자": context.get("top_partner", ""),
+        "당내협업": context.get("same_party_links", 0),
+        "당외협업": context.get("cross_party_links", 0),
+        "정당미확인협업": context.get("unknown_party_links", 0),
+        "당내협업비율": context.get("same_party_rate", 0),
+        "당외협업비율": context.get("cross_party_rate", 0),
+        "정당미확인비율": context.get("unknown_party_rate", 0),
+        "초당협업유형": context.get("bipartisanship_type", ""),
+    }
+    if not bool(state.get("bills_enabled", True)):
+        return {
+            "cosponsor_network_context": context,
+            "cosponsor_network_analysis": "",
+            "cosponsor_network_analysis_source": "disabled_bills",
+            "cosponsor_network_partners": partners,
+            "cosponsor_network_committees": committees,
+            "cosponsor_network_summary": summary,
+            "errors": errors,
+        }
+    if not partners:
+        return {
+            "cosponsor_network_context": context,
+            "cosponsor_network_analysis": fallback_cosponsor_network_analysis(context),
+            "cosponsor_network_analysis_source": "empty",
+            "cosponsor_network_partners": partners,
+            "cosponsor_network_committees": committees,
+            "cosponsor_network_summary": summary,
+            "errors": errors,
+        }
+    if not bool(state.get("llm_insights_enabled", DEFAULT_LLM_INSIGHTS_ENABLED)):
+        return {
+            "cosponsor_network_context": context,
+            "cosponsor_network_analysis": fallback_cosponsor_network_analysis(context),
+            "cosponsor_network_analysis_source": "rule_fallback_disabled",
+            "cosponsor_network_partners": partners,
+            "cosponsor_network_committees": committees,
+            "cosponsor_network_summary": summary,
+            "errors": errors,
+        }
+    if bool(state.get("llm_quota_exhausted", False)):
+        return {
+            "cosponsor_network_context": context,
+            "cosponsor_network_analysis": fallback_cosponsor_network_analysis(context),
+            "cosponsor_network_analysis_source": "rule_fallback_quota",
+            "cosponsor_network_partners": partners,
+            "cosponsor_network_committees": committees,
+            "cosponsor_network_summary": summary,
+            "errors": errors,
+            "llm_quota_exhausted": True,
+        }
+    try:
+        progress_log(state, "공동발의 네트워크 분석 시작")
+        analysis, source = generate_cosponsor_network_analysis(context)
+        progress_log(state, f"공동발의 네트워크 분석 완료: {source}")
+        return {
+            "cosponsor_network_context": context,
+            "cosponsor_network_analysis": analysis,
+            "cosponsor_network_analysis_source": source,
+            "cosponsor_network_partners": partners,
+            "cosponsor_network_committees": committees,
+            "cosponsor_network_summary": summary,
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
+        }
+    except Exception as error:
+        quota_exhausted = is_llm_quota_error(error)
+        if quota_exhausted:
+            errors.append("공동발의 네트워크 LLM 분석은 Gemini 한도 초과로 규칙 기반 요약으로 대체했습니다.")
+        else:
+            errors.append(f"공동발의 네트워크 LLM 분석 실패: {sanitize_error(error)}")
+        return {
+            "cosponsor_network_context": context,
+            "cosponsor_network_analysis": fallback_cosponsor_network_analysis(context),
+            "cosponsor_network_analysis_source": "rule_fallback_after_error",
+            "cosponsor_network_partners": partners,
+            "cosponsor_network_committees": committees,
+            "cosponsor_network_summary": summary,
             "errors": errors,
             "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)) or quota_exhausted,
         }
@@ -1395,6 +1822,148 @@ def analyze_vote_interpretation_node(state: MemberActivityState) -> MemberActivi
             "vote_interpretation_context": context,
             "vote_interpretation_analysis": fallback_vote_interpretation_analysis(context),
             "vote_interpretation_analysis_source": "rule_fallback_after_error",
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)) or quota_exhausted,
+        }
+
+
+def build_activity_briefing_context(state: MemberActivityState) -> Dict[str, Any]:
+    party_alignment_summary = state.get("party_alignment_summary", [])
+    aligned = sum(int(row.get("일치", 0) or 0) for row in party_alignment_summary)
+    dissented = sum(int(row.get("이탈", 0) or 0) for row in party_alignment_summary)
+    judged = aligned + dissented
+    alignment_rate = round(aligned / judged * 100, 1) if judged else None
+    return {
+        "member_name": state.get("member_name", ""),
+        "analysis_terms": state.get("analysis_terms", []),
+        "bill_total": len(state.get("sponsored_bills", [])),
+        "representative_total": len(state.get("representative_bills", [])),
+        "cosponsored_total": len(state.get("cosponsored_bills", [])),
+        "top_bill_committees": state.get("bill_committee_stats", [])[:5],
+        "vote_total": len(state.get("vote_records", [])),
+        "vote_summary_by_term": state.get("vote_summary_by_term", []),
+        "party_alignment_rate": alignment_rate,
+        "party_alignment_summary": party_alignment_summary,
+        "recent_news_total": len(state.get("recent_news_items", [])),
+        "recent_news_titles": [
+            {
+                "title": normalize_space(item.get("title")),
+                "source": normalize_space(item.get("source")),
+            }
+            for item in state.get("recent_news_items", [])[:5]
+        ],
+    }
+
+
+def fallback_activity_briefing(context: Dict[str, Any]) -> str:
+    member_name = normalize_space(context.get("member_name")) or "해당 의원"
+    bill_total = int(context.get("bill_total", 0) or 0)
+    rep_total = int(context.get("representative_total", 0) or 0)
+    co_total = int(context.get("cosponsored_total", 0) or 0)
+    vote_total = int(context.get("vote_total", 0) or 0)
+    recent_news_total = int(context.get("recent_news_total", 0) or 0)
+    alignment_rate = context.get("party_alignment_rate")
+    top_committees = context.get("top_bill_committees", [])
+
+    lines = [
+        f"- {member_name} 의원은 선택된 조회 범위에서 발의법안 {bill_total:,}건, 표결 {vote_total:,}건이 확인됩니다.",
+    ]
+    if bill_total:
+        lines.append(f"- 발의법안은 대표발의 {rep_total:,}건과 공동발의 {co_total:,}건으로 구성되어 입법 활동의 역할 구성을 함께 봐야 합니다.")
+    if top_committees:
+        committee_text = ", ".join(f"{row.get('소관위원회')} {row.get('건수')}건" for row in top_committees[:3])
+        lines.append(f"- 소관위원회 기준으로는 {committee_text} 분야가 상대적으로 많이 나타납니다.")
+    if alignment_rate is not None:
+        lines.append(f"- 정당 다수 입장과의 일치율은 유효 판정 표결 기준 약 {alignment_rate:.1f}%입니다.")
+    if recent_news_total:
+        lines.append(f"- 최근 뉴스 검색 결과는 {recent_news_total:,}건이며, 웹 검색 기반 이슈 맥락으로만 참고해야 합니다.")
+    lines.append("- 이 브리핑은 원자료를 빠르게 읽기 위한 요약이며, 정치적 성과나 의도를 단정하지 않습니다.")
+    return "\n".join(lines[:5])
+
+
+def generate_activity_briefing(context: Dict[str, Any]) -> tuple[str, str]:
+    cache_key = [
+        "google",
+        "activity_briefing_v1",
+        DEFAULT_LLM_MODEL,
+        context.get("member_name"),
+        json.dumps(context, ensure_ascii=False, sort_keys=True),
+    ]
+    cached = load_cache("activity_briefing", cache_key)
+    if cached:
+        return str(cached), "cache"
+
+    google_api_key = get_google_api_key()
+    if not google_api_key or ChatGoogleGenerativeAI is None:
+        return fallback_activity_briefing(context), "rule_fallback"
+
+    system_prompt = (
+        "당신은 국회의원 활동 데이터의 첫 화면 브리핑을 작성하는 데이터 리서치 어시스턴트입니다. "
+        "제공된 JSON 지표만 근거로 사용하고, 정치적 성과·의도·호불호를 단정하지 마세요."
+    )
+    user_prompt = f"""
+아래 JSON context를 바탕으로 사용자가 차트와 표를 보기 전에 읽을 핵심 브리핑을 작성하세요.
+
+규칙:
+- 3~5개 Markdown bullet로 작성하세요.
+- 각 bullet은 한 문장 중심으로 짧게 쓰세요.
+- 발의법안 수, 대표/공동발의 비중, 소관위원회 분포, 표결 수, 정당 일치율, 최근 뉴스 수 중 데이터가 있는 항목을 골고루 반영하세요.
+- '두드러진다', '확인된다', '참고할 수 있다'처럼 조심스럽게 표현하세요.
+- 최근 뉴스는 웹 검색 기반 맥락이며 공식 의정활동 데이터와 구분된다고 언급하세요.
+- 데이터에 없는 정치적 의도, 성과 평가, 사실관계 단정은 하지 마세요.
+- 제목은 쓰지 마세요.
+
+context:
+{json.dumps(context, ensure_ascii=False, indent=2)}
+""".strip()
+    llm = ChatGoogleGenerativeAI(model=DEFAULT_LLM_MODEL, temperature=0.15)
+    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+    briefing = normalize_markdown(getattr(response, "content", ""))
+    if not briefing:
+        return fallback_activity_briefing(context), "rule_fallback"
+    save_cache("activity_briefing", cache_key, briefing)
+    return briefing, "llm"
+
+
+def generate_activity_briefing_node(state: MemberActivityState) -> MemberActivityState:
+    errors = list(state.get("errors", []))
+    context = build_activity_briefing_context(state)
+    if not bool(state.get("llm_insights_enabled", DEFAULT_LLM_INSIGHTS_ENABLED)):
+        return {
+            "activity_briefing_context": context,
+            "activity_briefing": fallback_activity_briefing(context),
+            "activity_briefing_source": "rule_fallback_disabled",
+            "errors": errors,
+        }
+    if bool(state.get("llm_quota_exhausted", False)):
+        return {
+            "activity_briefing_context": context,
+            "activity_briefing": fallback_activity_briefing(context),
+            "activity_briefing_source": "rule_fallback_quota",
+            "errors": errors,
+            "llm_quota_exhausted": True,
+        }
+    try:
+        progress_log(state, "의원 활동 핵심 브리핑 생성 시작")
+        briefing, source = generate_activity_briefing(context)
+        progress_log(state, f"의원 활동 핵심 브리핑 생성 완료: {source}")
+        return {
+            "activity_briefing_context": context,
+            "activity_briefing": briefing,
+            "activity_briefing_source": source,
+            "errors": errors,
+            "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
+        }
+    except Exception as error:
+        quota_exhausted = is_llm_quota_error(error)
+        if quota_exhausted:
+            errors.append("의원 활동 핵심 브리핑은 Gemini 한도 초과로 규칙 기반 요약으로 대체했습니다.")
+        else:
+            errors.append(f"의원 활동 핵심 브리핑 생성 실패: {sanitize_error(error)}")
+        return {
+            "activity_briefing_context": context,
+            "activity_briefing": fallback_activity_briefing(context),
+            "activity_briefing_source": "rule_fallback_after_error",
             "errors": errors,
             "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)) or quota_exhausted,
         }
@@ -1873,20 +2442,24 @@ def build_member_activity_graph(client: AssemblyAPIClient):
     workflow.add_node("normalize_user_request", normalize_input_node)
     workflow.add_node("get_member_info", make_fetch_member_info_node(client))
     workflow.add_node("search_member_bills", make_fetch_bills_node(client))
+    workflow.add_node("analyze_cosponsor_network", analyze_cosponsor_network_node)
     workflow.add_node("analyze_legislative_interests", analyze_legislative_interests_node)
     workflow.add_node("get_all_member_votes", make_fetch_votes_node(client))
     workflow.add_node("analyze_party_alignment", make_analyze_party_alignment_node(client))
     workflow.add_node("interpret_vote_statistics", analyze_vote_interpretation_node)
     workflow.add_node("search_recent_member_news", search_recent_member_news_node)
+    workflow.add_node("generate_activity_briefing", generate_activity_briefing_node)
     workflow.add_node("summarize_member_activity", summarize_node)
     workflow.add_edge(START, "normalize_user_request")
     workflow.add_edge("normalize_user_request", "get_member_info")
     workflow.add_edge("get_member_info", "search_member_bills")
     workflow.add_edge("search_member_bills", "analyze_legislative_interests")
-    workflow.add_edge("analyze_legislative_interests", "get_all_member_votes")
+    workflow.add_edge("analyze_legislative_interests", "analyze_cosponsor_network")
+    workflow.add_edge("analyze_cosponsor_network", "get_all_member_votes")
     workflow.add_edge("get_all_member_votes", "analyze_party_alignment")
     workflow.add_edge("analyze_party_alignment", "interpret_vote_statistics")
     workflow.add_edge("interpret_vote_statistics", "search_recent_member_news")
-    workflow.add_edge("search_recent_member_news", "summarize_member_activity")
+    workflow.add_edge("search_recent_member_news", "generate_activity_briefing")
+    workflow.add_edge("generate_activity_briefing", "summarize_member_activity")
     workflow.add_edge("summarize_member_activity", END)
     return workflow.compile()
