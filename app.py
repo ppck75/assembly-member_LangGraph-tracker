@@ -13,7 +13,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.member_activity_workflow import (
-    DEFAULT_BILL_TERM_SCOPE,
     DEFAULT_ENABLE_COSPONSOR_SCAN,
     DEFAULT_MAX_BILL_PAGES,
     DEFAULT_MAX_COSPONSOR_SCAN_PAGES,
@@ -51,6 +50,7 @@ APP_VOTE_DETAIL_SLIDER_MAX = 1000
 APP_PARTY_ALIGNMENT_SLIDER_MAX = 500
 MEMBER_DIRECTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 MEMBER_DIRECTORY_PAGE_SIZE = 9
+APP_DEFAULT_BILL_TERM_SCOPE = "recent"
 
 
 @st.cache_data(ttl=MEMBER_DIRECTORY_CACHE_TTL_SECONDS, show_spinner=False)
@@ -1521,14 +1521,14 @@ with st.sidebar:
         "recent": "최근 재임 대수",
         "all": "전체 재임 대수",
     }
-    bill_term_scope = DEFAULT_BILL_TERM_SCOPE
+    bill_term_scope = APP_DEFAULT_BILL_TERM_SCOPE
     vote_detail_limit = 200
     party_alignment_limit = DEFAULT_PARTY_ALIGNMENT_LIMIT
     if advanced_options_enabled:
         bill_term_scope_label = st.radio(
             "발의법안 조회 범위",
             list(bill_scope_options.values()),
-            index=list(bill_scope_options.keys()).index(DEFAULT_BILL_TERM_SCOPE),
+            index=list(bill_scope_options.keys()).index(APP_DEFAULT_BILL_TERM_SCOPE),
             horizontal=True,
             disabled=not bills_enabled,
             help=(
