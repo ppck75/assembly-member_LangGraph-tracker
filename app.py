@@ -421,7 +421,8 @@ def render_member_directory_section() -> None:
     if "show_member_directory" not in st.session_state:
         st.session_state["show_member_directory"] = False
 
-    with st.expander("의원 목록 조회", expanded=not st.session_state.get("member_activity_result")):
+    directory_expanded = bool(st.session_state["show_member_directory"]) or not st.session_state.get("member_activity_result")
+    with st.expander("의원 목록 조회", expanded=directory_expanded):
         st.caption("카드에서 의원을 선택하면 왼쪽 사이드바의 국회의원 이름 입력칸에 반영됩니다.")
         st.caption("의원 목록을 처음 조회할 때는 API 호출과 캐시 생성으로 아주 잠깐 시간이 걸릴 수 있습니다.")
         st.button("의원 목록 불러오기", use_container_width=True, on_click=show_member_directory)
