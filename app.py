@@ -746,7 +746,7 @@ def render_cosponsor_network_graph(result: Dict[str, Any], partners_override: Li
         # Power scaling separates high-frequency collaborators more clearly than sqrt,
         # while keeping low-frequency nodes readable.
         scaled = (max(count, 1) / max_count) ** 0.75
-        return int(round(10 + scaled * 36))
+        return int(round((10 + scaled * 36) * 0.9))
 
     def edge_width(count: int) -> float:
         scaled = (max(count, 1) / max_count) ** 0.75
