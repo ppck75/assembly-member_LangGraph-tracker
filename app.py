@@ -743,13 +743,14 @@ def render_cosponsor_network_graph(result: Dict[str, Any], partners_override: Li
     max_count = max(as_int(partner.get("공동발의건수")) for partner in partners) or 1
 
     def partner_node_size(count: int) -> int:
-        # Square-root scaling keeps large collaborators visible without letting one node dominate.
-        scaled = (max(count, 1) / max_count) ** 0.5
-        return int(round(14 + scaled * 20))
+        # Power scaling separates high-frequency collaborators more clearly than sqrt,
+        # while keeping low-frequency nodes readable.
+        scaled = (max(count, 1) / max_count) ** 0.75
+        return int(round(10 + scaled * 36))
 
     def edge_width(count: int) -> float:
-        scaled = (max(count, 1) / max_count) ** 0.5
-        return round(1.2 + scaled * 5.2, 2)
+        scaled = (max(count, 1) / max_count) ** 0.75
+        return round(0.8 + scaled * 7.0, 2)
 
     nodes = [
         {
@@ -757,7 +758,7 @@ def render_cosponsor_network_graph(result: Dict[str, Any], partners_override: Li
             "label": member_name,
             "title": f"{member_name} 의원",
             "shape": "dot",
-            "size": 34,
+            "size": 36,
             "x": 0,
             "y": 0,
             "fixed": {"x": True, "y": True},
@@ -792,7 +793,11 @@ def render_cosponsor_network_graph(result: Dict[str, Any], partners_override: Li
                 "y": round(math.sin(angle) * radius, 2),
                 "fixed": {"x": True, "y": True},
                 "color": color,
-                "font": {"size": 13, "color": "#334155"},
+                "font": {
+                    "size": 14 if count >= max_count * 0.6 else 12,
+                    "color": "#334155",
+                    "bold": count >= max_count * 0.6,
+                },
             }
         )
         edges.append(
