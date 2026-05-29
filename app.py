@@ -13,6 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.member_activity_workflow import (
+    DEFAULT_BILL_TERM_SCOPE,
     DEFAULT_ENABLE_COSPONSOR_SCAN,
     DEFAULT_MAX_BILL_PAGES,
     DEFAULT_MAX_COSPONSOR_SCAN_PAGES,
@@ -525,6 +526,7 @@ def build_initial_state(member_name: str, options: Dict[str, Any]) -> Dict[str, 
         "assembly_terms": DEFAULT_TERMS,
         "recent_limit": 10,
         "bills_enabled": options["bills_enabled"],
+        "bill_term_scope": options["bill_term_scope"],
         "vote_detail_enabled": options["vote_detail_enabled"],
         "max_bill_pages": options["max_bill_pages"],
         "max_vote_pages": DEFAULT_MAX_VOTE_PAGES,
@@ -1476,41 +1478,12 @@ with st.sidebar:
             "끄면 표결 탭은 비어 있지만 정당 다수 입장 일치 분석은 별도 옵션으로 실행할 수 있습니다."
         ),
     )
-    vote_detail_limit = st.slider(
-        "초기 표결 상세 범위",
-        min_value=50,
-        max_value=APP_VOTE_DETAIL_SLIDER_MAX,
-        value=200,
-        step=50,
-        disabled=not vote_detail_enabled,
-        help=(
-            "초기 표결 상세 조회 범위입니다. 최솟값은 최근 50건입니다. "
-            f"슬라이더를 오른쪽 끝({APP_VOTE_DETAIL_SLIDER_MAX})까지 당기면 해당 대수 전체 표결을 조회합니다."
-        ),
-    )
-    max_vote_bills = 0 if vote_detail_enabled and vote_detail_limit == APP_VOTE_DETAIL_SLIDER_MAX else int(vote_detail_limit)
-    if vote_detail_enabled:
-        st.caption("선택 범위: 전체 조회" if max_vote_bills == 0 else f"선택 범위: 최근 {max_vote_bills}건")
-    if vote_detail_enabled and max_vote_bills == 0:
-        st.warning("전체 표결 조회는 첫 실행 또는 캐시 만료 시 수 분 이상 걸릴 수 있습니다.", icon="⏳")
     party_alignment_enabled = st.checkbox(
         "정당 다수 입장 일치 분석",
         value=True,
         help=(
             "각 표결에서 같은 정당 의원들의 다수 표결값을 계산하고, 해당 의원의 표결이 그 다수 입장과 일치했는지 비교합니다. "
             "의안별 전체 의원 표결을 조회하므로 범위를 키우면 시간이 길어질 수 있습니다."
-        ),
-    )
-    party_alignment_limit = st.slider(
-        "정당 일치도 최근 N건",
-        min_value=50,
-        max_value=APP_PARTY_ALIGNMENT_SLIDER_MAX,
-        value=DEFAULT_PARTY_ALIGNMENT_LIMIT,
-        step=50,
-        disabled=not party_alignment_enabled,
-        help=(
-            "정당 다수 입장 일치도를 계산할 최근 표결 수입니다. "
-            f"최댓값은 {APP_PARTY_ALIGNMENT_SLIDER_MAX}건이며, 의안별 전체 의원 표결을 조회하는 비용을 제한하기 위한 상한입니다."
         ),
     )
     recent_news_enabled = st.checkbox(
@@ -1532,12 +1505,77 @@ with st.sidebar:
     )
     if not gemini_api_key.strip():
         st.caption("LLM 분석을 사용하려면 페이지 상단에 Gemini API 키를 입력하세요.")
+
+    st.divider()
+    st.subheader("세부 설정")
+    st.caption("조회 범위와 실행 비용을 조정합니다. 기본값으로도 바로 분석할 수 있습니다.")
+    st.caption(
+        f"기본값: 발의법안 최근 재임 대수 · 표결 최근 200건 · 정당 일치도 최근 {DEFAULT_PARTY_ALIGNMENT_LIMIT}건"
+    )
+    advanced_options_enabled = st.toggle(
+        "세부 설정 열기",
+        value=False,
+        help="발의법안 조회 범위, 초기 표결 상세 범위, 정당 일치도 조회 범위를 직접 조정합니다.",
+    )
+    bill_scope_options = {
+        "recent": "최근 재임 대수",
+        "all": "전체 재임 대수",
+    }
+    bill_term_scope = DEFAULT_BILL_TERM_SCOPE
+    vote_detail_limit = 200
+    party_alignment_limit = DEFAULT_PARTY_ALIGNMENT_LIMIT
+    if advanced_options_enabled:
+        bill_term_scope_label = st.radio(
+            "발의법안 조회 범위",
+            list(bill_scope_options.values()),
+            index=list(bill_scope_options.keys()).index(DEFAULT_BILL_TERM_SCOPE),
+            horizontal=True,
+            disabled=not bills_enabled,
+            help=(
+                "최근 재임 대수는 현재 활동 맥락을 보기 좋고, 전체 재임 대수는 누적 입법 활동을 보기 좋습니다. "
+                "공동발의 네트워크와 입법 관심 분야 분석도 이 범위를 기준으로 계산됩니다."
+            ),
+        )
+        bill_term_scope = next(key for key, label in bill_scope_options.items() if label == bill_term_scope_label)
+        vote_detail_limit = st.slider(
+            "초기 표결 상세 범위",
+            min_value=50,
+            max_value=APP_VOTE_DETAIL_SLIDER_MAX,
+            value=200,
+            step=50,
+            disabled=not vote_detail_enabled,
+            help=(
+                "초기 표결 상세 조회 범위입니다. 최솟값은 최근 50건입니다. "
+                f"슬라이더를 오른쪽 끝({APP_VOTE_DETAIL_SLIDER_MAX})까지 당기면 해당 대수 전체 표결을 조회합니다."
+            ),
+        )
+        party_alignment_limit = st.slider(
+            "정당 일치도 최근 N건",
+            min_value=50,
+            max_value=APP_PARTY_ALIGNMENT_SLIDER_MAX,
+            value=DEFAULT_PARTY_ALIGNMENT_LIMIT,
+            step=50,
+            disabled=not party_alignment_enabled,
+            help=(
+                "정당 다수 입장 일치도를 계산할 최근 표결 수입니다. "
+                f"최댓값은 {APP_PARTY_ALIGNMENT_SLIDER_MAX}건이며, 의안별 전체 의원 표결을 조회하는 비용을 제한하기 위한 상한입니다."
+            ),
+        )
+        max_vote_bills = 0 if vote_detail_enabled and vote_detail_limit == APP_VOTE_DETAIL_SLIDER_MAX else int(vote_detail_limit)
+        if vote_detail_enabled:
+            st.caption("초기 표결 상세 선택 범위: 전체 조회" if max_vote_bills == 0 else f"초기 표결 상세 선택 범위: 최근 {max_vote_bills}건")
+        if vote_detail_enabled and max_vote_bills == 0:
+            st.warning("전체 표결 조회는 첫 실행 또는 캐시 만료 시 수 분 이상 걸릴 수 있습니다.", icon="⏳")
+    else:
+        max_vote_bills = int(vote_detail_limit)
+
     run_button = st.button("분석 시작", type="primary", use_container_width=True)
 
 options = {
     "party_alignment_vote_limit": int(party_alignment_limit),
     "max_vote_bills_to_scan": int(max_vote_bills),
     "max_bill_pages": APP_BILL_PAGE_SCAN,
+    "bill_term_scope": bill_term_scope,
     "vote_fetch_workers": DEFAULT_VOTE_FETCH_WORKERS,
     "bills_enabled": bool(bills_enabled),
     "vote_detail_enabled": bool(vote_detail_enabled),

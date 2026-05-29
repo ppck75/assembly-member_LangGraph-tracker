@@ -6,6 +6,7 @@ import html
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -28,13 +29,15 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v16_cosponsor_party_layout_fix"
+WORKFLOW_VERSION = "member_activity_v17_bill_scope_option"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
 ENDPOINT_VOTE_BILLS = "ncocpgfiaoituanbr"  # 의안별 표결현황
 ENDPOINT_MEMBERS = "ALLNAMEMBER"  # 국회의원 정보 통합 API
 HTTP_TIMEOUT = 20
+HTTP_RETRY_ATTEMPTS = 3
+HTTP_RETRY_BACKOFF_SECONDS = 0.35
 NEWS_HTTP_TIMEOUT = 8
 SUPPORTED_MEMBER_TERMS = list(range(1, 23))
 SUPPORTED_BILL_TERMS = list(range(10, 23))
@@ -45,7 +48,7 @@ DEFAULT_MAX_BILL_PAGES = 2
 DEFAULT_MAX_VOTE_PAGES = 200
 DEFAULT_MAX_VOTE_BILLS_TO_SCAN = 0  # 0이면 해당 대수의 표결 의안 전체 조회
 DEFAULT_VOTE_FETCH_WORKERS = 8
-DEFAULT_PARTY_ALIGNMENT_LIMIT = 50
+DEFAULT_PARTY_ALIGNMENT_LIMIT = 100
 DEFAULT_LLM_INSIGHTS_ENABLED = True
 DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_RECENT_NEWS_LIMIT = 10
@@ -53,6 +56,7 @@ RECENT_NEWS_CACHE_TTL_HOURS = 6
 DEFAULT_ENABLE_COSPONSOR_SCAN = True
 DEFAULT_MAX_COSPONSOR_SCAN_PAGES = 5
 DEFAULT_SHOW_PROGRESS = True
+DEFAULT_BILL_TERM_SCOPE = "recent"
 
 
 class MemberActivityState(TypedDict, total=False):
@@ -71,6 +75,7 @@ class MemberActivityState(TypedDict, total=False):
     non_served_terms: List[int]
     recent_limit: int
     bills_enabled: bool
+    bill_term_scope: str
     vote_detail_enabled: bool
     max_bill_pages: int
     max_vote_pages: int
@@ -354,9 +359,22 @@ class AssemblyAPIClient:
             p_size = int(params.get("pSize", 100))
             query_params = {key: value for key, value in params.items() if key != "pSize" and value not in (None, "")}
             payload = {"KEY": self.api_key, "Type": "json", "pIndex": page, "pSize": p_size, **query_params}
-            response = requests.get(f"{BASE_URL}/{api_res}", params=payload, timeout=HTTP_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
+            last_error: Optional[Exception] = None
+            for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+                try:
+                    response = requests.get(f"{BASE_URL}/{api_res}", params=payload, timeout=HTTP_TIMEOUT)
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+                except Exception as error:
+                    last_error = error
+                    if attempt >= HTTP_RETRY_ATTEMPTS:
+                        raise
+                    time.sleep(HTTP_RETRY_BACKOFF_SECONDS * attempt)
+            else:
+                if last_error:
+                    raise last_error
+                data = {}
             result = data.get("RESULT") if isinstance(data, dict) else None
             if isinstance(result, dict) and normalize_space(result.get("CODE")).startswith("ERROR"):
                 raise RuntimeError(normalize_space(result.get("MESSAGE")) or normalize_space(result.get("CODE")))
@@ -643,6 +661,7 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "non_served_terms": [],
         "recent_limit": int(state.get("recent_limit") or DEFAULT_RECENT_LIMIT),
         "bills_enabled": bool(state.get("bills_enabled", True)),
+        "bill_term_scope": normalize_space(state.get("bill_term_scope")) or DEFAULT_BILL_TERM_SCOPE,
         "vote_detail_enabled": bool(state.get("vote_detail_enabled", True)),
         "max_bill_pages": int(state.get("max_bill_pages") or DEFAULT_MAX_BILL_PAGES),
         "max_vote_pages": int(state.get("max_vote_pages") or DEFAULT_MAX_VOTE_PAGES),
@@ -684,6 +703,9 @@ def make_fetch_member_info_node(client: AssemblyAPIClient):
             for row in rows:
                 row["_SERVED_TERMS"] = format_terms(served_terms)
             profile_summary = build_profile_summary(member_name, rows, served_terms or analysis_terms)
+            all_bill_terms = intersect_terms(analysis_terms, SUPPORTED_BILL_TERMS)
+            bill_term_scope = normalize_space(state.get("bill_term_scope")) or DEFAULT_BILL_TERM_SCOPE
+            bill_terms = all_bill_terms[:1] if bill_term_scope == "recent" else all_bill_terms
             all_vote_terms = intersect_terms(analysis_terms, SUPPORTED_VOTE_TERMS)
             initial_vote_terms = all_vote_terms[:1]
             additional_vote_terms = all_vote_terms[1:]
@@ -694,7 +716,7 @@ def make_fetch_member_info_node(client: AssemblyAPIClient):
                 "analysis_terms": analysis_terms,
                 "non_served_terms": non_served_terms,
                 "member_terms": intersect_terms(analysis_terms, SUPPORTED_MEMBER_TERMS),
-                "bill_terms": intersect_terms(analysis_terms, SUPPORTED_BILL_TERMS),
+                "bill_terms": bill_terms,
                 "all_vote_terms": all_vote_terms,
                 "vote_terms": initial_vote_terms,
                 "additional_vote_terms": additional_vote_terms,
