@@ -289,8 +289,8 @@
 │           └──────────────────────┼──────────────────────┘                    │
 │                                  │                                           │
 │                          ┌────────▼─────────┐                                │
-│                          │ 사용자 (시민, 기자,│                              │
-│                          │  정책 분석가)    │                              │
+│                          │ 사용자            │                              │
+│                          │                   │                              │
 │                          └──────────────────┘                                │
 │                                                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -316,15 +316,15 @@
 
 ## 📂 프로젝트 구조 (Project Structure)
 
-📂
-├── 의원_활동_추적_랭그래프_워크플로우.ipynb
-├── app.py (Streamlit 메인 애플리케이션)
-├── src/
-│   ├── member_activity_workflow.py
-│   ├── member_directory.py
-│   └── streamlit_runtime.py
-├── requirements.txt
-└── README.md
+📂  
+├── 의원_활동_추적_랭그래프_워크플로우.ipynb  
+├── app.py (Streamlit 메인 애플리케이션)  
+├── src/  
+│   ├── member_activity_workflow.py   
+│   ├── member_directory.py  
+│   └── streamlit_runtime.py  
+├── requirements.txt  
+└── README.md  
 
 ---
 
