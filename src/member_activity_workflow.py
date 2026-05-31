@@ -29,7 +29,7 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v17_bill_scope_option"
+WORKFLOW_VERSION = "member_activity_v18_party_alignment_fast"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
@@ -1543,19 +1543,17 @@ def is_full_bill_vote_cached(age: int, bill: Dict[str, Any]) -> bool:
     return bool(bill_id) and is_cache_fresh("bill_votes_full_v2", [age, bill_id])
 
 
-def fetch_all_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str, Any]) -> List[Dict[str, Any]]:
+def is_party_bill_vote_cached(age: int, bill: Dict[str, Any], party: str) -> bool:
+    bill_id = normalize_space(bill.get("BILL_ID"))
+    normalized_party = normalize_party_name(party)
+    return bool(bill_id and normalized_party) and is_cache_fresh("bill_votes_party_v1", [age, bill_id, normalized_party])
+
+
+def enrich_vote_rows_for_bill(rows: List[Dict[str, Any]], age: int, bill: Dict[str, Any]) -> List[Dict[str, Any]]:
     bill_id = normalize_space(bill.get("BILL_ID"))
     bill_no = normalize_space(bill.get("BILL_NO"))
-    if not bill_id:
-        return []
-    # v2: pSize=100으로 여러 페이지를 가져옵니다. pSize=300은 API가 100건으로 잘라 반환할 때 앞 페이지만 캐시할 수 있습니다.
-    cached = load_cache("bill_votes_full_v2", [age, bill_id])
-    if cached is not None:
-        return cached
-
-    rows = client.get_rows(ENDPOINT_MEMBER_VOTES, {"AGE": age, "BILL_ID": bill_id, "pSize": 100}, max_pages=5)
-    rows = dedupe_records(rows, ["BILL_ID", "BILL_NO", "HG_NM", "NAAS_NM", "MONA_CD", "VOTE_DATE", "RESULT_VOTE_MOD"])
-    for row in rows:
+    enriched = dedupe_records(rows, ["BILL_ID", "BILL_NO", "HG_NM", "NAAS_NM", "MONA_CD", "VOTE_DATE", "RESULT_VOTE_MOD"])
+    for row in enriched:
         row["_REQUEST_AGE"] = age
         row["_VOTE_RESULT"] = normalize_vote_result(row)
         row.setdefault("BILL_ID", bill_id)
@@ -1564,6 +1562,43 @@ def fetch_all_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str
         row.setdefault("VOTE_DATE", bill.get("PROC_DT", ""))
         row.setdefault("CURR_COMMITTEE", bill.get("CURR_COMMITTEE", ""))
         row.setdefault("BILL_URL", bill.get("LINK_URL", ""))
+    return enriched
+
+
+def fetch_party_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str, Any], party: str) -> List[Dict[str, Any]]:
+    bill_id = normalize_space(bill.get("BILL_ID"))
+    normalized_party = normalize_party_name(party)
+    if not bill_id or not normalized_party:
+        return []
+    cached = load_cache("bill_votes_party_v1", [age, bill_id, normalized_party])
+    if cached is not None:
+        return cached
+
+    rows = client.get_rows(
+        ENDPOINT_MEMBER_VOTES,
+        {"AGE": age, "BILL_ID": bill_id, "POLY_NM": party, "pSize": 100},
+        max_pages=3,
+    )
+    rows = enrich_vote_rows_for_bill(rows, age, bill)
+    party_rows = [row for row in rows if normalize_party_name(party_name_from_row(row)) == normalized_party]
+    # Some OpenAPI filters are best-effort. If the response has no party column, keep the response
+    # rather than forcing an expensive full-assembly fallback.
+    result = party_rows or rows
+    save_cache("bill_votes_party_v1", [age, bill_id, normalized_party], result)
+    return result
+
+
+def fetch_all_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str, Any]) -> List[Dict[str, Any]]:
+    bill_id = normalize_space(bill.get("BILL_ID"))
+    if not bill_id:
+        return []
+    # v2: pSize=100으로 여러 페이지를 가져옵니다. pSize=300은 API가 100건으로 잘라 반환할 때 앞 페이지만 캐시할 수 있습니다.
+    cached = load_cache("bill_votes_full_v2", [age, bill_id])
+    if cached is not None:
+        return cached
+
+    rows = client.get_rows(ENDPOINT_MEMBER_VOTES, {"AGE": age, "BILL_ID": bill_id, "pSize": 100}, max_pages=3)
+    rows = enrich_vote_rows_for_bill(rows, age, bill)
     save_cache("bill_votes_full_v2", [age, bill_id], rows)
     return rows
 
@@ -1614,8 +1649,12 @@ def analyze_party_alignment_for_bill(
     known_target_row: Optional[Dict[str, Any]] = None,
     target_party_hint: str = "",
 ) -> Dict[str, Any]:
-    all_rows = fetch_all_votes_for_bill(client, age, bill)
-    target_rows = filter_member_vote_rows(all_rows, member_name, mona_codes)
+    target_party_hint = party_name_from_row(known_target_row or {}) or normalize_space(target_party_hint)
+    if normalize_party_name(target_party_hint):
+        vote_rows = fetch_party_votes_for_bill(client, age, bill, target_party_hint)
+    else:
+        vote_rows = fetch_all_votes_for_bill(client, age, bill)
+    target_rows = filter_member_vote_rows(vote_rows, member_name, mona_codes)
     if not target_rows and known_target_row:
         target_rows = [known_target_row]
     bill_id = normalize_space(bill.get("BILL_ID"))
@@ -1632,7 +1671,7 @@ def analyze_party_alignment_for_bill(
         "분류": "판정 제외",
         "제외사유": "",
     }
-    if not all_rows:
+    if not vote_rows:
         base["제외사유"] = "의안별 전체 표결정보 없음"
         return base
 
@@ -1646,7 +1685,14 @@ def analyze_party_alignment_for_bill(
         target_vote = "불참(추정)"
         target_party = normalize_space(target_party_hint) or "정당 미확인"
 
-    party_rows = [row for row in all_rows if party_name_from_row(row) == target_party]
+    normalized_target_party = normalize_party_name(target_party)
+    party_rows = [
+        row
+        for row in vote_rows
+        if normalize_party_name(party_name_from_row(row)) == normalized_target_party
+    ]
+    if not party_rows and normalized_target_party and vote_rows:
+        party_rows = vote_rows
     counts = vote_counts(party_rows)
     if target_missing_from_bill_rows and target_party not in {"", "정당 미확인", "무소속"}:
         counts["불참"] = int(counts.get("불참", 0)) + 1
@@ -2019,9 +2065,14 @@ def make_analyze_party_alignment_node(client: AssemblyAPIClient):
             try:
                 vote_bills = fetch_vote_bill_candidates(client, age, max_pages=max_pages, limit=limit)
                 term_stat["분석대상표결"] = len(vote_bills)
-                term_stat["BILL_ID캐시적중"] = sum(1 for bill in vote_bills if is_full_bill_vote_cached(age, bill))
+                age_party = member_party_by_age.get(int(age), "")
+                term_stat["BILL_ID캐시적중"] = sum(
+                    1
+                    for bill in vote_bills
+                    if is_party_bill_vote_cached(age, bill, age_party) or is_full_bill_vote_cached(age, bill)
+                )
                 term_stat["API신규조회대상"] = len(vote_bills) - term_stat["BILL_ID캐시적중"]
-                progress_log(state, f"{age}대 정당 일치도 BILL_ID 캐시: 적중 {term_stat['BILL_ID캐시적중']}건 / 신규조회대상 {term_stat['API신규조회대상']}건")
+                progress_log(state, f"{age}대 정당 일치도 정당별 표결 캐시: 적중 {term_stat['BILL_ID캐시적중']}건 / 신규조회대상 {term_stat['API신규조회대상']}건")
                 completed = 0
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                     futures = [
