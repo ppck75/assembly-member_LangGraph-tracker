@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import html
+import math
 import os
 import re
 import sys
@@ -29,7 +30,7 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v18_party_alignment_fast"
+WORKFLOW_VERSION = "member_activity_v20_vote_scope_cache_reuse"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
@@ -47,7 +48,7 @@ DEFAULT_RECENT_LIMIT = 10
 DEFAULT_MAX_BILL_PAGES = 2
 DEFAULT_MAX_VOTE_PAGES = 200
 DEFAULT_MAX_VOTE_BILLS_TO_SCAN = 0  # 0이면 해당 대수의 표결 의안 전체 조회
-DEFAULT_VOTE_FETCH_WORKERS = 4
+DEFAULT_VOTE_FETCH_WORKERS = 6
 DEFAULT_PARTY_ALIGNMENT_LIMIT = 100
 DEFAULT_LLM_INSIGHTS_ENABLED = True
 DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
@@ -80,6 +81,7 @@ class MemberActivityState(TypedDict, total=False):
     max_bill_pages: int
     max_vote_pages: int
     max_vote_bills_to_scan: int
+    force_vote_refresh: bool
     vote_fetch_workers: int
     party_alignment_enabled: bool
     party_alignment_vote_limit: int
@@ -666,6 +668,7 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "max_bill_pages": int(state.get("max_bill_pages") or DEFAULT_MAX_BILL_PAGES),
         "max_vote_pages": int(state.get("max_vote_pages") or DEFAULT_MAX_VOTE_PAGES),
         "max_vote_bills_to_scan": int(state.get("max_vote_bills_to_scan", DEFAULT_MAX_VOTE_BILLS_TO_SCAN)),
+        "force_vote_refresh": bool(state.get("force_vote_refresh", False)),
         "vote_fetch_workers": int(state.get("vote_fetch_workers") or DEFAULT_VOTE_FETCH_WORKERS),
         "party_alignment_enabled": bool(state.get("party_alignment_enabled", True)),
         "party_alignment_vote_limit": int(state.get("party_alignment_vote_limit", DEFAULT_PARTY_ALIGNMENT_LIMIT)),
@@ -1420,6 +1423,59 @@ def save_member_votes_term_cache(age: int, member_name: str, max_pages: int, max
     save_cache("member_votes_by_term_v1", member_votes_term_cache_key(age, member_name, max_pages, max_vote_bills), value)
 
 
+def cached_term_is_complete(cached_term: Dict[str, Any]) -> bool:
+    if "complete" in cached_term:
+        return bool(cached_term.get("complete"))
+    stat = dict(cached_term.get("stat", {}) or {})
+    target = int(stat.get("표결의안", 0) or 0)
+    success = int(stat.get("상세조회성공", 0) or 0)
+    failed = int(stat.get("상세조회실패", 0) or 0)
+    return bool(target and success >= target and failed == 0)
+
+
+def cached_success_bill_ids(cached_term: Dict[str, Any], rows: List[Dict[str, Any]]) -> set[str]:
+    ids = {
+        normalize_space(value)
+        for value in cached_term.get("success_bill_ids", [])
+        if normalize_space(value)
+    }
+    ids.update(normalize_space(row.get("BILL_ID")) for row in rows if normalize_space(row.get("BILL_ID")))
+    return ids
+
+
+def cache_member_vote_rows_by_bill(age: int, member_name: str, rows: List[Dict[str, Any]]) -> None:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        bill_id = normalize_space(row.get("BILL_ID"))
+        if not bill_id:
+            continue
+        grouped.setdefault(bill_id, []).append(row)
+    for bill_id, bill_rows in grouped.items():
+        save_cache("member_vote", [age, bill_id, normalize_space(member_name)], bill_rows)
+
+
+def compatible_vote_cache_limits(max_vote_bills: int) -> List[int]:
+    known_limits = [50, 100, 200, 500, 1000]
+    if max_vote_bills <= 0:
+        return sorted(known_limits, reverse=True)
+    return sorted([limit for limit in known_limits if limit < max_vote_bills], reverse=True)
+
+
+def load_compatible_member_votes_term_cache(
+    age: int,
+    member_name: str,
+    max_pages: int,
+    max_vote_bills: int,
+) -> Optional[Dict[str, Any]]:
+    for limit in compatible_vote_cache_limits(max_vote_bills):
+        cached = load_member_votes_term_cache(age, member_name, max_pages, limit)
+        if cached and cached.get("rows"):
+            result = dict(cached)
+            result["_source_limit"] = limit
+            return result
+    return None
+
+
 def normalize_cached_vote_rows(rows: List[Dict[str, Any]], age: int) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for row in rows:
@@ -1464,9 +1520,12 @@ def fetch_member_votes_direct_for_term(
 ) -> List[Dict[str, Any]]:
     query_attempts: List[Dict[str, Any]] = [{"AGE": age, "HG_NM": member_name, "pSize": 100}]
     query_attempts.extend({"AGE": age, "MONA_CD": code, "pSize": 100} for code in mona_codes)
+    effective_max_pages = max_pages
+    if limit and limit > 0:
+        effective_max_pages = max(1, min(max_pages, math.ceil(limit / 100) + 1))
 
     for query in query_attempts:
-        page_rows = client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=max_pages)
+        page_rows = client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=effective_max_pages)
         matched_rows = filter_member_vote_rows(page_rows, member_name, mona_codes)
         if not matched_rows and normalize_space(query.get("HG_NM")) == member_name:
             # Some API responses already apply HG_NM but omit a name/code column in edge cases.
@@ -1489,14 +1548,15 @@ def fetch_member_vote_for_bill(
     bill: Dict[str, Any],
     member_name: str,
     mona_codes: List[str],
+    force_refresh: bool = False,
 ) -> List[Dict[str, Any]]:
     bill_id = normalize_space(bill.get("BILL_ID"))
     bill_no = normalize_space(bill.get("BILL_NO"))
     if not bill_id:
         return []
     cache_key = [age, bill_id, normalize_space(member_name)]
-    cached = load_cache("member_vote", cache_key)
-    if cached is None:
+    cached = None if force_refresh else load_cache("member_vote", cache_key)
+    if cached is None and not force_refresh:
         legacy_cache_key = [age, bill_id, member_name, ",".join(mona_codes)]
         cached = load_cache("member_vote", legacy_cache_key)
         if cached is not None:
@@ -2158,6 +2218,7 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
         member_name = state["member_name"]
         max_pages = int(state.get("max_vote_pages") or DEFAULT_MAX_VOTE_PAGES)
         max_vote_bills = int(state.get("max_vote_bills_to_scan", DEFAULT_MAX_VOTE_BILLS_TO_SCAN))
+        force_refresh = bool(state.get("force_vote_refresh", False))
         workers = max(1, int(state.get("vote_fetch_workers") or DEFAULT_VOTE_FETCH_WORKERS))
         vote_terms = state.get("vote_terms", SUPPORTED_VOTE_TERMS)
         mona_codes = member_code_candidates(state)
@@ -2173,63 +2234,117 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
         for age in vote_terms:
             term_stat = {"AGE": age, "표결의안": 0, "상세조회성공": 0, "상세조회실패": 0, "매칭표결": 0, "캐시사용": "N"}
             try:
-                cached_term = load_member_votes_term_cache(age, member_name, max_pages, max_vote_bills)
+                cached_term = None if force_refresh else load_member_votes_term_cache(age, member_name, max_pages, max_vote_bills)
+                cached_rows: List[Dict[str, Any]] = []
+                cached_success_ids: set[str] = set()
+                compatible_cache_source = 0
+                if cached_term is None and not force_refresh:
+                    compatible_term = load_compatible_member_votes_term_cache(age, member_name, max_pages, max_vote_bills)
+                    if compatible_term is not None:
+                        cached_term = compatible_term
+                        compatible_cache_source = int(compatible_term.get("_source_limit", 0) or 0)
                 if cached_term is not None:
                     cached_rows = normalize_cached_vote_rows(cached_term.get("rows", []), age)
                     cached_stat = dict(cached_term.get("stat", {}))
                     term_stat.update({key: cached_stat.get(key, term_stat.get(key)) for key in term_stat})
                     term_stat["매칭표결"] = len(cached_rows)
-                    term_stat["캐시사용"] = "Y"
-                    rows.extend(cached_rows)
-                    vote_fetch_stats.append(term_stat)
-                    progress_log(state, f"{age}대 표결정보 대수 단위 캐시 사용: {len(cached_rows)}건")
-                    continue
+                    cached_success_ids = cached_success_bill_ids(cached_term, cached_rows)
+                    if not compatible_cache_source and cached_term_is_complete(cached_term):
+                        term_stat["캐시사용"] = "Y"
+                        rows.extend(cached_rows)
+                        vote_fetch_stats.append(term_stat)
+                        progress_log(state, f"{age}대 표결정보 대수 단위 캐시 사용: {len(cached_rows)}건")
+                        continue
+                    term_stat["캐시사용"] = "부분"
+                    term_stat["상세조회실패"] = 0
+                    term_stat["상세조회성공"] = len(cached_success_ids)
+                    term_stat["매칭표결"] = len(cached_rows)
+                    if compatible_cache_source:
+                        progress_log(state, f"{age}대 표결정보 {compatible_cache_source}건 범위 캐시 재사용: 성공 {len(cached_success_ids)}건, 확장분만 조회")
+                    else:
+                        progress_log(state, f"{age}대 표결정보 부분 캐시 사용: 성공 {len(cached_success_ids)}건, 실패분만 재조회")
 
-                progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 시도")
-                try:
-                    direct_rows = fetch_member_votes_direct_for_term(client, age, member_name, mona_codes, max_pages=max_pages, limit=max_vote_bills)
-                except Exception as error:
-                    direct_rows = []
-                    progress_log(state, f"{age}대 의원명 기준 일괄 조회 실패: BILL_ID별 조회로 전환")
-                if direct_rows:
-                    term_stat["표결의안"] = len(direct_rows)
-                    term_stat["상세조회성공"] = len(direct_rows)
-                    term_stat["매칭표결"] = len(direct_rows)
-                    term_stat["조회방식"] = "의원명일괄조회"
-                    rows.extend(direct_rows)
-                    save_member_votes_term_cache(age, member_name, max_pages, max_vote_bills, {"rows": direct_rows, "stat": term_stat})
-                    progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 완료: {len(direct_rows)}건")
-                    vote_fetch_stats.append(term_stat)
-                    continue
+                if cached_term is None:
+                    progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 시도")
+                    try:
+                        direct_rows = fetch_member_votes_direct_for_term(client, age, member_name, mona_codes, max_pages=max_pages, limit=max_vote_bills)
+                    except Exception as error:
+                        direct_rows = []
+                        errors.append(f"{age}대 의원명 기준 표결 일괄 조회 실패: {sanitize_error(error)}")
+                        progress_log(state, f"{age}대 의원명 기준 일괄 조회 실패: BILL_ID별 조회로 전환")
+                    if direct_rows:
+                        term_stat["표결의안"] = len(direct_rows)
+                        term_stat["상세조회성공"] = len(direct_rows)
+                        term_stat["매칭표결"] = len(direct_rows)
+                        term_stat["조회방식"] = "의원명일괄조회"
+                        rows.extend(direct_rows)
+                        cache_member_vote_rows_by_bill(age, member_name, direct_rows)
+                        success_ids = [normalize_space(row.get("BILL_ID")) for row in direct_rows if normalize_space(row.get("BILL_ID"))]
+                        save_member_votes_term_cache(
+                            age,
+                            member_name,
+                            max_pages,
+                            max_vote_bills,
+                            {"rows": direct_rows, "stat": term_stat, "success_bill_ids": success_ids, "failed_bill_ids": [], "complete": True},
+                        )
+                        progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 완료: {len(direct_rows)}건")
+                        vote_fetch_stats.append(term_stat)
+                        continue
 
                 progress_log(state, f"{age}대 의원명 기준 일괄 조회 결과 없음: BILL_ID별 병렬 조회로 전환")
                 vote_bills = fetch_vote_bill_candidates(client, age, max_pages=max_pages, limit=max_vote_bills)
+                remaining_vote_bills = [
+                    bill for bill in vote_bills if normalize_space(bill.get("BILL_ID")) not in cached_success_ids
+                ]
                 term_stat["표결의안"] = len(vote_bills)
+                term_stat["상세조회성공"] = len(cached_success_ids)
+                term_stat["매칭표결"] = len(cached_rows)
                 term_stat["조회방식"] = "BILL_ID별조회"
-                progress_log(state, f"{age}대 표결 의안 후보 {len(vote_bills)}건 확보")
+                progress_log(state, f"{age}대 표결 의안 후보 {len(vote_bills)}건 확보, 재조회 대상 {len(remaining_vote_bills)}건")
                 completed = 0
-                term_rows: List[Dict[str, Any]] = []
+                term_rows: List[Dict[str, Any]] = list(cached_rows)
+                success_bill_ids = set(cached_success_ids)
+                failed_bill_ids: List[str] = []
                 with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [executor.submit(fetch_member_vote_for_bill, client, age, bill, member_name, mona_codes) for bill in vote_bills]
+                    futures = {
+                        executor.submit(fetch_member_vote_for_bill, client, age, bill, member_name, mona_codes, force_refresh): normalize_space(bill.get("BILL_ID"))
+                        for bill in remaining_vote_bills
+                    }
                     for future in as_completed(futures):
                         completed += 1
+                        bill_id = futures[future]
                         try:
                             member_rows = future.result()
                             term_rows.extend(member_rows)
                             term_stat["상세조회성공"] += 1
                             term_stat["매칭표결"] += len(member_rows)
+                            if bill_id:
+                                success_bill_ids.add(bill_id)
                         except Exception as error:
                             term_stat["상세조회실패"] += 1
+                            if bill_id:
+                                failed_bill_ids.append(bill_id)
                             if term_stat["상세조회실패"] <= 3:
                                 errors.append(f"{age}대 표결 상세 조회 실패: {sanitize_error(error)}")
-                        if completed % 25 == 0 or completed == len(futures):
-                            progress_log(state, f"{age}대 표결 상세 조회 진행: {completed}/{len(futures)} (성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
+                        if completed % 10 == 0 or completed == len(futures):
+                            progress_log(state, f"{age}대 표결 상세 조회 진행: {completed}/{len(futures)} (누적 성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
                 if term_stat["상세조회실패"] > 3:
                     errors.append(f"{age}대 표결 상세 조회 실패 {term_stat['상세조회실패']}건 중 3건만 상세 표시했습니다. 대부분 열린국회정보 API 연결 타임아웃입니다.")
                 rows.extend(term_rows)
-                if term_stat["상세조회실패"] == 0 and term_stat["상세조회성공"] == term_stat["표결의안"]:
-                    save_member_votes_term_cache(age, member_name, max_pages, max_vote_bills, {"rows": term_rows, "stat": term_stat})
+                complete = term_stat["상세조회성공"] >= term_stat["표결의안"] and term_stat["상세조회실패"] == 0
+                cache_value = {
+                    "rows": term_rows,
+                    "stat": term_stat,
+                    "success_bill_ids": sorted(success_bill_ids),
+                    "failed_bill_ids": failed_bill_ids,
+                    "complete": complete,
+                }
+                save_member_votes_term_cache(age, member_name, max_pages, max_vote_bills, cache_value)
+                if complete:
                     progress_log(state, f"{age}대 표결정보 대수 단위 캐시 저장: {len(term_rows)}건")
+                else:
+                    errors.append(f"{age}대 표결 상세 조회는 {term_stat['상세조회성공']}/{term_stat['표결의안']}건만 완료되어 부분 결과를 저장했습니다. 다음 실행에서는 실패한 표결만 재시도합니다.")
+                    progress_log(state, f"{age}대 표결정보 부분 캐시 저장: 성공 {term_stat['상세조회성공']}건, 실패 {term_stat['상세조회실패']}건")
             except Exception as error:
                 term_stat["상세조회실패"] += 1
                 errors.append(f"{age}대 표결의안 목록 조회 실패: {sanitize_error(error)}")
