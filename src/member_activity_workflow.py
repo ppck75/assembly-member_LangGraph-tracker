@@ -30,7 +30,7 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v20_vote_scope_cache_reuse"
+WORKFLOW_VERSION = "member_activity_v21_vote_page_cache_reuse"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
@@ -50,6 +50,7 @@ DEFAULT_MAX_VOTE_PAGES = 200
 DEFAULT_MAX_VOTE_BILLS_TO_SCAN = 0  # 0이면 해당 대수의 표결 의안 전체 조회
 DEFAULT_VOTE_FETCH_WORKERS = 6
 DEFAULT_PARTY_ALIGNMENT_LIMIT = 100
+PARTY_ALIGNMENT_PARTY_MAX_PAGES = 2
 DEFAULT_LLM_INSIGHTS_ENABLED = True
 DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_RECENT_NEWS_LIMIT = 10
@@ -355,32 +356,36 @@ def parse_openapi_rows(data: Any, api_res: str) -> List[Dict[str, Any]]:
 class AssemblyAPIClient:
     api_key: str
 
+    def get_rows_page(self, api_res: str, params: Dict[str, Any], page: int) -> List[Dict[str, Any]]:
+        p_size = int(params.get("pSize", 100))
+        query_params = {key: value for key, value in params.items() if key != "pSize" and value not in (None, "")}
+        payload = {"KEY": self.api_key, "Type": "json", "pIndex": page, "pSize": p_size, **query_params}
+        last_error: Optional[Exception] = None
+        for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+            try:
+                response = requests.get(f"{BASE_URL}/{api_res}", params=payload, timeout=HTTP_TIMEOUT)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as error:
+                last_error = error
+                if attempt >= HTTP_RETRY_ATTEMPTS:
+                    raise
+                time.sleep(HTTP_RETRY_BACKOFF_SECONDS * attempt)
+        else:
+            if last_error:
+                raise last_error
+            data = {}
+        result = data.get("RESULT") if isinstance(data, dict) else None
+        if isinstance(result, dict) and normalize_space(result.get("CODE")).startswith("ERROR"):
+            raise RuntimeError(normalize_space(result.get("MESSAGE")) or normalize_space(result.get("CODE")))
+        return parse_openapi_rows(data, api_res)
+
     def get_rows(self, api_res: str, params: Dict[str, Any], max_pages: int = 1) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for page in range(1, max_pages + 1):
             p_size = int(params.get("pSize", 100))
-            query_params = {key: value for key, value in params.items() if key != "pSize" and value not in (None, "")}
-            payload = {"KEY": self.api_key, "Type": "json", "pIndex": page, "pSize": p_size, **query_params}
-            last_error: Optional[Exception] = None
-            for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
-                try:
-                    response = requests.get(f"{BASE_URL}/{api_res}", params=payload, timeout=HTTP_TIMEOUT)
-                    response.raise_for_status()
-                    data = response.json()
-                    break
-                except Exception as error:
-                    last_error = error
-                    if attempt >= HTTP_RETRY_ATTEMPTS:
-                        raise
-                    time.sleep(HTTP_RETRY_BACKOFF_SECONDS * attempt)
-            else:
-                if last_error:
-                    raise last_error
-                data = {}
-            result = data.get("RESULT") if isinstance(data, dict) else None
-            if isinstance(result, dict) and normalize_space(result.get("CODE")).startswith("ERROR"):
-                raise RuntimeError(normalize_space(result.get("MESSAGE")) or normalize_space(result.get("CODE")))
-            page_rows = parse_openapi_rows(data, api_res)
+            page_rows = self.get_rows_page(api_res, params, page)
             if not page_rows:
                 break
             rows.extend(page_rows)
@@ -1525,7 +1530,23 @@ def fetch_member_votes_direct_for_term(
         effective_max_pages = max(1, min(max_pages, math.ceil(limit / 100) + 1))
 
     for query in query_attempts:
-        page_rows = client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=effective_max_pages)
+        page_rows: List[Dict[str, Any]] = []
+        query_failed_after_partial = False
+        for page in range(1, effective_max_pages + 1):
+            try:
+                current_rows = client.get_rows_page(ENDPOINT_MEMBER_VOTES, query, page)
+            except Exception:
+                query_failed_after_partial = bool(page_rows)
+                if query_failed_after_partial:
+                    break
+                raise
+            if not current_rows:
+                break
+            page_rows.extend(current_rows)
+            if limit and len(page_rows) >= limit:
+                break
+            if len(current_rows) < int(query.get("pSize", 100)):
+                break
         matched_rows = filter_member_vote_rows(page_rows, member_name, mona_codes)
         if not matched_rows and normalize_space(query.get("HG_NM")) == member_name:
             # Some API responses already apply HG_NM but omit a name/code column in edge cases.
@@ -1538,6 +1559,9 @@ def fetch_member_votes_direct_for_term(
         rows = sorted(rows, key=lambda row: date_sort_value(row, "VOTE_DATE", "PROC_DT"), reverse=True)
         if limit and limit > 0:
             rows = rows[:limit]
+        if query_failed_after_partial:
+            for row in rows:
+                row["_PARTIAL_DIRECT_FETCH"] = True
         return rows
     return []
 
@@ -1606,7 +1630,10 @@ def is_full_bill_vote_cached(age: int, bill: Dict[str, Any]) -> bool:
 def is_party_bill_vote_cached(age: int, bill: Dict[str, Any], party: str) -> bool:
     bill_id = normalize_space(bill.get("BILL_ID"))
     normalized_party = normalize_party_name(party)
-    return bool(bill_id and normalized_party) and is_cache_fresh("bill_votes_party_v1", [age, bill_id, normalized_party])
+    return bool(bill_id and normalized_party) and (
+        is_cache_fresh("bill_votes_party_page_v1", [age, bill_id, normalized_party, 1])
+        or is_cache_fresh("bill_votes_party_v1", [age, bill_id, normalized_party])
+    )
 
 
 def enrich_vote_rows_for_bill(rows: List[Dict[str, Any]], age: int, bill: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1625,27 +1652,56 @@ def enrich_vote_rows_for_bill(rows: List[Dict[str, Any]], age: int, bill: Dict[s
     return enriched
 
 
+def fetch_rows_by_cached_pages(
+    client: AssemblyAPIClient,
+    api_res: str,
+    params: Dict[str, Any],
+    cache_namespace: str,
+    cache_key_prefix: List[Any],
+    max_pages: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    p_size = int(params.get("pSize", 100))
+    for page in range(1, max_pages + 1):
+        cache_key = [*cache_key_prefix, page]
+        page_rows = load_cache(cache_namespace, cache_key)
+        if page_rows is None:
+            try:
+                page_rows = client.get_rows_page(api_res, params, page)
+            except Exception:
+                if rows:
+                    break
+                raise
+            save_cache(cache_namespace, cache_key, page_rows)
+        rows.extend(page_rows)
+        if len(page_rows) < p_size:
+            break
+    return rows
+
+
 def fetch_party_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str, Any], party: str) -> List[Dict[str, Any]]:
     bill_id = normalize_space(bill.get("BILL_ID"))
     normalized_party = normalize_party_name(party)
     if not bill_id or not normalized_party:
         return []
-    cached = load_cache("bill_votes_party_v1", [age, bill_id, normalized_party])
-    if cached is not None:
-        return cached
 
-    rows = client.get_rows(
+    legacy_cached = load_cache("bill_votes_party_v1", [age, bill_id, normalized_party])
+    if legacy_cached is not None:
+        return legacy_cached
+
+    rows = fetch_rows_by_cached_pages(
+        client,
         ENDPOINT_MEMBER_VOTES,
         {"AGE": age, "BILL_ID": bill_id, "POLY_NM": party, "pSize": 100},
-        max_pages=3,
+        "bill_votes_party_page_v1",
+        [age, bill_id, normalized_party],
+        max_pages=PARTY_ALIGNMENT_PARTY_MAX_PAGES,
     )
     rows = enrich_vote_rows_for_bill(rows, age, bill)
     party_rows = [row for row in rows if normalize_party_name(party_name_from_row(row)) == normalized_party]
     # Some OpenAPI filters are best-effort. If the response has no party column, keep the response
     # rather than forcing an expensive full-assembly fallback.
-    result = party_rows or rows
-    save_cache("bill_votes_party_v1", [age, bill_id, normalized_party], result)
-    return result
+    return party_rows or rows
 
 
 def fetch_all_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1657,7 +1713,14 @@ def fetch_all_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str
     if cached is not None:
         return cached
 
-    rows = client.get_rows(ENDPOINT_MEMBER_VOTES, {"AGE": age, "BILL_ID": bill_id, "pSize": 100}, max_pages=3)
+    rows = fetch_rows_by_cached_pages(
+        client,
+        ENDPOINT_MEMBER_VOTES,
+        {"AGE": age, "BILL_ID": bill_id, "pSize": 100},
+        "bill_votes_full_page_v1",
+        [age, bill_id],
+        max_pages=3,
+    )
     rows = enrich_vote_rows_for_bill(rows, age, bill)
     save_cache("bill_votes_full_v2", [age, bill_id], rows)
     return rows
@@ -2273,25 +2336,37 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
                         errors.append(f"{age}대 의원명 기준 표결 일괄 조회 실패: {sanitize_error(error)}")
                         progress_log(state, f"{age}대 의원명 기준 일괄 조회 실패: BILL_ID별 조회로 전환")
                     if direct_rows:
-                        term_stat["표결의안"] = len(direct_rows)
-                        term_stat["상세조회성공"] = len(direct_rows)
-                        term_stat["매칭표결"] = len(direct_rows)
-                        term_stat["조회방식"] = "의원명일괄조회"
-                        rows.extend(direct_rows)
                         cache_member_vote_rows_by_bill(age, member_name, direct_rows)
                         success_ids = [normalize_space(row.get("BILL_ID")) for row in direct_rows if normalize_space(row.get("BILL_ID"))]
-                        save_member_votes_term_cache(
-                            age,
-                            member_name,
-                            max_pages,
-                            max_vote_bills,
-                            {"rows": direct_rows, "stat": term_stat, "success_bill_ids": success_ids, "failed_bill_ids": [], "complete": True},
-                        )
-                        progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 완료: {len(direct_rows)}건")
-                        vote_fetch_stats.append(term_stat)
-                        continue
+                        partial_direct = any(bool(row.get("_PARTIAL_DIRECT_FETCH")) for row in direct_rows)
+                        if partial_direct:
+                            cached_rows = direct_rows
+                            cached_success_ids = set(success_ids)
+                            term_stat["캐시사용"] = "부분"
+                            term_stat["상세조회성공"] = len(cached_success_ids)
+                            term_stat["매칭표결"] = len(cached_rows)
+                            progress_log(state, f"{age}대 의원명 기준 표결 부분 조회: {len(direct_rows)}건 확보, 나머지만 BILL_ID별 조회")
+                        else:
+                            term_stat["표결의안"] = len(direct_rows)
+                            term_stat["상세조회성공"] = len(direct_rows)
+                            term_stat["매칭표결"] = len(direct_rows)
+                            term_stat["조회방식"] = "의원명일괄조회"
+                            rows.extend(direct_rows)
+                            save_member_votes_term_cache(
+                                age,
+                                member_name,
+                                max_pages,
+                                max_vote_bills,
+                                {"rows": direct_rows, "stat": term_stat, "success_bill_ids": success_ids, "failed_bill_ids": [], "complete": True},
+                            )
+                            progress_log(state, f"{age}대 의원명 기준 표결 일괄 조회 완료: {len(direct_rows)}건")
+                            vote_fetch_stats.append(term_stat)
+                            continue
 
-                progress_log(state, f"{age}대 의원명 기준 일괄 조회 결과 없음: BILL_ID별 병렬 조회로 전환")
+                if cached_rows:
+                    progress_log(state, f"{age}대 표결 상세 잔여분만 BILL_ID별 병렬 조회로 전환")
+                else:
+                    progress_log(state, f"{age}대 의원명 기준 일괄 조회 결과 없음: BILL_ID별 병렬 조회로 전환")
                 vote_bills = fetch_vote_bill_candidates(client, age, max_pages=max_pages, limit=max_vote_bills)
                 remaining_vote_bills = [
                     bill for bill in vote_bills if normalize_space(bill.get("BILL_ID")) not in cached_success_ids
