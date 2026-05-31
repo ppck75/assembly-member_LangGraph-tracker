@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, TypedDict
 from urllib.parse import quote_plus
 
 import requests
+from requests.adapters import HTTPAdapter
 from langgraph.graph import END, START, StateGraph
 
 
@@ -30,15 +32,15 @@ except Exception:
 
 from .config import CACHE_DIR, CACHE_TTL_HOURS, env_value, get_assembly_api_key, get_google_api_key
 
-WORKFLOW_VERSION = "member_activity_v21_vote_page_cache_reuse"
+WORKFLOW_VERSION = "member_activity_v22_vote_timeout_mitigation"
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
 ENDPOINT_VOTE_BILLS = "ncocpgfiaoituanbr"  # 의안별 표결현황
 ENDPOINT_MEMBERS = "ALLNAMEMBER"  # 국회의원 정보 통합 API
-HTTP_TIMEOUT = (5, 20)
-HTTP_RETRY_ATTEMPTS = 2
-HTTP_RETRY_BACKOFF_SECONDS = 0.35
+HTTP_TIMEOUT = (8, 25)
+HTTP_RETRY_ATTEMPTS = 3
+HTTP_RETRY_BACKOFF_SECONDS = 0.5
 NEWS_HTTP_TIMEOUT = 8
 SUPPORTED_MEMBER_TERMS = list(range(1, 23))
 SUPPORTED_BILL_TERMS = list(range(10, 23))
@@ -48,9 +50,10 @@ DEFAULT_RECENT_LIMIT = 10
 DEFAULT_MAX_BILL_PAGES = 2
 DEFAULT_MAX_VOTE_PAGES = 200
 DEFAULT_MAX_VOTE_BILLS_TO_SCAN = 0  # 0이면 해당 대수의 표결 의안 전체 조회
-DEFAULT_VOTE_FETCH_WORKERS = 6
+DEFAULT_VOTE_FETCH_WORKERS = 3
 DEFAULT_PARTY_ALIGNMENT_LIMIT = 100
 PARTY_ALIGNMENT_PARTY_MAX_PAGES = 2
+MEMBER_VOTE_TARGETED_PAGE_SIZE = 30
 DEFAULT_LLM_INSIGHTS_ENABLED = True
 DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_RECENT_NEWS_LIMIT = 10
@@ -58,6 +61,7 @@ RECENT_NEWS_CACHE_TTL_HOURS = 6
 DEFAULT_ENABLE_COSPONSOR_SCAN = True
 DEFAULT_MAX_COSPONSOR_SCAN_PAGES = 5
 DEFAULT_SHOW_PROGRESS = True
+_HTTP_SESSION_LOCAL = threading.local()
 DEFAULT_BILL_TERM_SCOPE = "recent"
 
 
@@ -352,6 +356,17 @@ def parse_openapi_rows(data: Any, api_res: str) -> List[Dict[str, Any]]:
     return []
 
 
+def get_http_session() -> requests.Session:
+    session = getattr(_HTTP_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _HTTP_SESSION_LOCAL.session = session
+    return session
+
+
 @dataclass
 class AssemblyAPIClient:
     api_key: str
@@ -363,7 +378,7 @@ class AssemblyAPIClient:
         last_error: Optional[Exception] = None
         for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
             try:
-                response = requests.get(f"{BASE_URL}/{api_res}", params=payload, timeout=HTTP_TIMEOUT)
+                response = get_http_session().get(f"{BASE_URL}/{api_res}", params=payload, timeout=HTTP_TIMEOUT)
                 response.raise_for_status()
                 data = response.json()
                 break
@@ -1588,12 +1603,20 @@ def fetch_member_vote_for_bill(
     if cached is not None:
         return cached
 
-    query_attempts = [{"AGE": age, "BILL_ID": bill_id, "HG_NM": member_name, "pSize": 300}]
-    query_attempts.extend({"AGE": age, "BILL_ID": bill_id, "MONA_CD": code, "pSize": 300} for code in mona_codes)
+    query_attempts = [{"AGE": age, "BILL_ID": bill_id, "HG_NM": member_name, "pSize": MEMBER_VOTE_TARGETED_PAGE_SIZE}]
+    query_attempts.extend(
+        {"AGE": age, "BILL_ID": bill_id, "MONA_CD": code, "pSize": MEMBER_VOTE_TARGETED_PAGE_SIZE}
+        for code in mona_codes
+    )
 
     rows: List[Dict[str, Any]] = []
+    query_errors: List[Exception] = []
     for query in query_attempts:
-        page_rows = client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=1)
+        try:
+            page_rows = client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=1)
+        except Exception as error:
+            query_errors.append(error)
+            continue
         matched_rows = filter_member_vote_rows(page_rows, member_name, mona_codes)
         if matched_rows:
             rows = matched_rows
@@ -1601,6 +1624,8 @@ def fetch_member_vote_for_bill(
         if page_rows and normalize_space(query.get("HG_NM")) == member_name:
             rows = page_rows
             break
+    if not rows and len(query_errors) == len(query_attempts) and query_errors:
+        raise query_errors[-1]
 
     for row in rows:
         row["_REQUEST_AGE"] = age
