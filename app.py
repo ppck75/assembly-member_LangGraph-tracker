@@ -1463,6 +1463,7 @@ if gemini_api_key:
 
 with st.sidebar:
     st.header("조회 설정")
+    st.caption(f"워크플로우 버전: {WORKFLOW_VERSION}")
     member_name = st.text_input("국회의원 이름", key="member_name_input")
     st.caption("의원 목록 조회 카드에서 의원을 선택하거나, 직접 입력하여 분석을 시작하세요.")
     selected_directory_member = str(st.session_state.get("selected_directory_member") or "").strip()
