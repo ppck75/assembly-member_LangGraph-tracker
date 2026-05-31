@@ -35,8 +35,8 @@ ENDPOINT_MEMBER_BILLS = "nzmimeepazxkubdpn"  # 국회의원 발의법률안
 ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정보
 ENDPOINT_VOTE_BILLS = "ncocpgfiaoituanbr"  # 의안별 표결현황
 ENDPOINT_MEMBERS = "ALLNAMEMBER"  # 국회의원 정보 통합 API
-HTTP_TIMEOUT = 20
-HTTP_RETRY_ATTEMPTS = 3
+HTTP_TIMEOUT = (5, 20)
+HTTP_RETRY_ATTEMPTS = 2
 HTTP_RETRY_BACKOFF_SECONDS = 0.35
 NEWS_HTTP_TIMEOUT = 8
 SUPPORTED_MEMBER_TERMS = list(range(1, 23))
@@ -47,7 +47,7 @@ DEFAULT_RECENT_LIMIT = 10
 DEFAULT_MAX_BILL_PAGES = 2
 DEFAULT_MAX_VOTE_PAGES = 200
 DEFAULT_MAX_VOTE_BILLS_TO_SCAN = 0  # 0이면 해당 대수의 표결 의안 전체 조회
-DEFAULT_VOTE_FETCH_WORKERS = 8
+DEFAULT_VOTE_FETCH_WORKERS = 4
 DEFAULT_PARTY_ALIGNMENT_LIMIT = 100
 DEFAULT_LLM_INSIGHTS_ENABLED = True
 DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
@@ -2046,9 +2046,12 @@ def make_analyze_party_alignment_node(client: AssemblyAPIClient):
                             term_stat["분석완료"] += 1
                         except Exception as error:
                             term_stat["상세조회실패"] += 1
-                            errors.append(f"{age}대 정당 일치도 분석 실패: {sanitize_error(error)}")
+                            if term_stat["상세조회실패"] <= 3:
+                                errors.append(f"{age}대 정당 일치도 분석 실패: {sanitize_error(error)}")
                         if completed % 10 == 0 or completed == len(futures):
                             progress_log(state, f"{age}대 정당 일치도 분석 진행: {completed}/{len(futures)} (성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
+                if term_stat["상세조회실패"] > 3:
+                    errors.append(f"{age}대 정당 일치도 분석 실패 {term_stat['상세조회실패']}건 중 3건만 상세 표시했습니다. 대부분 열린국회정보 API 연결 타임아웃입니다.")
             except Exception as error:
                 term_stat["상세조회실패"] += 1
                 errors.append(f"{age}대 정당 일치도 표결의안 조회 실패: {sanitize_error(error)}")
@@ -2166,9 +2169,12 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
                             term_stat["매칭표결"] += len(member_rows)
                         except Exception as error:
                             term_stat["상세조회실패"] += 1
-                            errors.append(f"{age}대 표결 상세 조회 실패: {sanitize_error(error)}")
+                            if term_stat["상세조회실패"] <= 3:
+                                errors.append(f"{age}대 표결 상세 조회 실패: {sanitize_error(error)}")
                         if completed % 25 == 0 or completed == len(futures):
                             progress_log(state, f"{age}대 표결 상세 조회 진행: {completed}/{len(futures)} (성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
+                if term_stat["상세조회실패"] > 3:
+                    errors.append(f"{age}대 표결 상세 조회 실패 {term_stat['상세조회실패']}건 중 3건만 상세 표시했습니다. 대부분 열린국회정보 API 연결 타임아웃입니다.")
                 rows.extend(term_rows)
                 if term_stat["상세조회실패"] == 0 and term_stat["상세조회성공"] == term_stat["표결의안"]:
                     save_member_votes_term_cache(age, member_name, max_pages, max_vote_bills, {"rows": term_rows, "stat": term_stat})

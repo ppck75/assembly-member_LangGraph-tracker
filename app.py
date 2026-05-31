@@ -46,6 +46,7 @@ st.set_page_config(
 
 APP_BILL_PAGE_SCAN = DEFAULT_MAX_BILL_PAGES
 APP_COSPONSOR_SCAN_PAGES = DEFAULT_MAX_COSPONSOR_SCAN_PAGES
+APP_DEFAULT_VOTE_DETAIL_LIMIT = 100
 APP_VOTE_DETAIL_SLIDER_MAX = 1000
 APP_PARTY_ALIGNMENT_SLIDER_MAX = 500
 MEMBER_DIRECTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
@@ -1516,7 +1517,7 @@ with st.sidebar:
     st.subheader("세부 설정")
     st.caption("조회 범위와 실행 비용을 조정합니다. 기본값으로도 바로 분석할 수 있습니다.")
     st.caption(
-        f"기본값: 발의법안 최근 재임 대수 · 표결 최근 200건 · 정당 일치도 최근 {DEFAULT_PARTY_ALIGNMENT_LIMIT}건"
+        f"기본값: 발의법안 최근 재임 대수 · 표결 최근 {APP_DEFAULT_VOTE_DETAIL_LIMIT}건 · 정당 일치도 최근 {DEFAULT_PARTY_ALIGNMENT_LIMIT}건"
     )
     advanced_options_enabled = st.toggle(
         "세부 설정 열기",
@@ -1528,7 +1529,7 @@ with st.sidebar:
         "all": "전체 재임 대수",
     }
     bill_term_scope = APP_DEFAULT_BILL_TERM_SCOPE
-    vote_detail_limit = 200
+    vote_detail_limit = APP_DEFAULT_VOTE_DETAIL_LIMIT
     party_alignment_limit = DEFAULT_PARTY_ALIGNMENT_LIMIT
     if advanced_options_enabled:
         bill_term_scope_label = st.radio(
@@ -1547,7 +1548,7 @@ with st.sidebar:
             "초기 표결 상세 범위",
             min_value=50,
             max_value=APP_VOTE_DETAIL_SLIDER_MAX,
-            value=200,
+            value=APP_DEFAULT_VOTE_DETAIL_LIMIT,
             step=50,
             disabled=not vote_detail_enabled,
             help=(
