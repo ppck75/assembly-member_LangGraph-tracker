@@ -1,8 +1,8 @@
 # 🕵️‍♂️ assembly-member_LangGraph-tracker
 
-> **LangGraph 기반 대한민국 국회의원 활동 및 입법 프로세스 추적 AI 에이전트**
+> **LangGraph 기반 대한민국 국회의원 의정활동 추적 AI 에이전트**
 >
-> 본 프로젝트는 디지털 공론장(Digital Public Sphere) 및 감시 저널리즘(Watchdog Journalism) 이론을 고도화된 AI 파이프라인으로 구현한 시스템입니다. 복잡하고 산재된 국회 의정활동 데이터를 통합 수집 및 분석하여 시민들의 의정활동 감시 및 의원 평가를 지원합니다.
+> 본 프로젝트는 복잡하고 산재된 국회 의정활동 데이터를 통합 수집 및 분석하여 시민들의 의정활동 감시 및 의원 평가를 제공하는 웹페이지입니다. 감시 저널리즘(Watchdog Journalism) 이론을 고도화된 AI 파이프라인으로 구현한 시스템입니다. 
 
 🌐 URL: https://national-assembly.streamlit.app/  
 
