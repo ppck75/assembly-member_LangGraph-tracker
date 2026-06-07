@@ -8,6 +8,29 @@
 
 🌐 URL: https://national-assembly.streamlit.app/  
 
+사용한 열린국회정보 API
+
+<table>
+  <tr>
+    <td>
+      <img src="assets/open-assembly-api/member-info-api.png" alt="국회의원 정보 통합 API" width="360">
+    </td>
+    <td>
+      <img src="assets/open-assembly-api/member-bills-api.png" alt="국회의원 발의법률안" width="360">
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="assets/open-assembly-api/bill-vote-status-api.png" alt="의안별 표결현황" width="360">
+    </td>
+    <td>
+      <img src="assets/open-assembly-api/member-plenary-vote-api.png" alt="국회의원 본회의 표결정보" width="360">
+    </td>
+  </tr>
+</table>
+
+**최근 의원 관련 이슈는 Google News RSS를 사용하였다.**
+
 ---
 
 ## 🌟 주요 기능 (Key Features)
