@@ -29,6 +29,8 @@
   </tr>
 </table>
 
+*출처:https://open.assembly.go.kr/portal/openapi/openApiNaListPage.do*
+
 **최근 의원 관련 이슈는 Google News RSS를 사용하였다.**
 
 ---
