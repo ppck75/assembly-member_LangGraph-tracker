@@ -113,6 +113,54 @@ def render_dataframe(
     )
 
 
+def render_vote_summary_text(title: str, rows: Iterable[Dict[str, Any]]) -> None:
+    st.subheader(title)
+    summary_rows = list(rows or [])
+    if not summary_rows:
+        st.info("표결 요약 데이터가 없습니다.")
+        return
+
+    for row in summary_rows:
+        age = row.get("AGE", "-")
+        total = as_int(row.get("전체"))
+        yes = as_int(row.get("찬성"))
+        no = as_int(row.get("반대"))
+        abstain = as_int(row.get("기권"))
+        absent = as_int(row.get("불참"))
+        st.markdown(
+            f"- **{age}대**: 전체 **{total:,}건** · "
+            f"찬성 {yes:,}건 / 반대 {no:,}건 / 기권 {abstain:,}건 / 불참 {absent:,}건"
+        )
+
+
+def render_vote_fetch_status_text(title: str, rows: Iterable[Dict[str, Any]]) -> None:
+    st.subheader(title)
+    status_rows = list(rows or [])
+    if not status_rows:
+        st.info("표결 조회 상태 데이터가 없습니다.")
+        return
+
+    total_bills = sum(as_int(row.get("표결의안")) for row in status_rows)
+    total_success = sum(as_int(row.get("상세조회성공")) for row in status_rows)
+    total_failed = sum(as_int(row.get("상세조회실패")) for row in status_rows)
+    total_matched = sum(as_int(row.get("매칭표결")) for row in status_rows)
+    st.markdown(
+        f"표결 의안 **{total_bills:,}건** 중 상세조회 **{total_success:,}건 성공**, "
+        f"**{total_failed:,}건 실패**, 의원 매칭 표결 **{total_matched:,}건**입니다."
+    )
+
+    for row in status_rows:
+        age = row.get("AGE", "-")
+        cache_status = row.get("캐시사용")
+        cache_text = f" · 캐시 {cache_status}" if cache_status not in (None, "") else ""
+        st.markdown(
+            f"- **{age}대**: 표결의안 {as_int(row.get('표결의안')):,}건 / "
+            f"상세조회 성공 {as_int(row.get('상세조회성공')):,}건 / "
+            f"실패 {as_int(row.get('상세조회실패')):,}건 / "
+            f"매칭표결 {as_int(row.get('매칭표결')):,}건{cache_text}"
+        )
+
+
 def toggle_directory_member(member_name: str, member_key: str) -> None:
     if st.session_state.get("selected_directory_member_key") == member_key:
         st.session_state["member_name_input"] = ""
@@ -1284,12 +1332,10 @@ def render_votes_tab(result: Dict[str, Any]) -> None:
         st.markdown(vote_interpretation_text)
     st.divider()
 
-    vote_summary_cols = ["AGE", "전체", "찬성", "반대", "기권", "불참"]
-    vote_fetch_cols = ["AGE", "표결의안", "상세조회성공", "상세조회실패", "매칭표결", "캐시사용"]
     vote_cols = ["_VOTE_RESULT", "AGE", "VOTE_DATE", "BILL_NO", "BILL_NAME", "LAW_TITLE", "CURR_COMMITTEE", "POLY_NM", "ORIG_NM", "BILL_URL"]
 
-    render_dataframe("대수별 표결 요약", summary, vote_summary_cols, height=180)
-    render_dataframe("표결 조회 상태", result.get("vote_fetch_stats", []), vote_fetch_cols, height=180)
+    render_vote_summary_text("대수별 표결 요약", summary)
+    render_vote_fetch_status_text("표결 조회 상태", result.get("vote_fetch_stats", []))
 
     vote_tabs = st.tabs(["찬성", "반대", "기권", "불참", "전체"])
     with vote_tabs[0]:
@@ -1424,8 +1470,8 @@ def render_additional_vote_lookup(result: Dict[str, Any]) -> None:
     if st.session_state.get("additional_vote_update"):
         update = st.session_state["additional_vote_update"]
         st.info("아래는 추가 대수 표결 조회 결과입니다.")
-        render_dataframe("추가 대수별 표결 요약", update.get("vote_summary_by_term", []), ["AGE", "전체", "찬성", "반대", "기권", "불참"], height=180)
-        render_dataframe("추가 표결 조회 상태", update.get("vote_fetch_stats", []), ["AGE", "표결의안", "상세조회성공", "상세조회실패", "매칭표결", "캐시사용"], height=180)
+        render_vote_summary_text("추가 대수별 표결 요약", update.get("vote_summary_by_term", []))
+        render_vote_fetch_status_text("추가 표결 조회 상태", update.get("vote_fetch_stats", []))
 
 
 def render_result(result: Dict[str, Any]) -> None:
