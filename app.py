@@ -586,6 +586,7 @@ def run_analysis(member_name: str, options: Dict[str, Any]) -> Dict[str, Any]:
     detail_box = st.empty()
     completed_box = st.container()
     completed_steps: List[str] = []
+    max_progress_percent = 0
 
     def progress_callback(message: str) -> None:
         detail_box.caption(f"세부 진행: {message}")
@@ -593,14 +594,15 @@ def run_analysis(member_name: str, options: Dict[str, Any]) -> Dict[str, Any]:
     initial_state["progress_callback"] = progress_callback
 
     with st.status("의원 활동을 조회하고 있습니다.", expanded=True) as status:
-        st.write("의원 기본정보, 발의법안, 표결정보, 정당 일치도, 최근 이슈를 순서대로 분석합니다.")
+        st.write("의원 기본정보 확인 후 발의법안, 표결정보, 최근 이슈를 병렬로 분석합니다.")
         for event in app.stream(initial_state, stream_mode="updates"):
             for node_name, node_update in event.items():
                 label = WORKFLOW_STEP_LABELS.get(node_name, node_name)
                 description = WORKFLOW_STEP_DESCRIPTIONS.get(node_name, "")
                 percent = WORKFLOW_PROGRESS.get(node_name, min(95, len(completed_steps) * 10))
+                max_progress_percent = max(max_progress_percent, percent)
 
-                progress.progress(percent, text=f"{label} 완료 ({percent}%)")
+                progress.progress(max_progress_percent, text=f"{label} 완료 ({max_progress_percent}%)")
                 step_box.info(f"현재 단계: {label}\n\n{description}")
 
                 if node_update:

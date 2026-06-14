@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, TypedDict
+from typing import Annotated, Any, Dict, Iterable, List, Optional, TypedDict
 from urllib.parse import quote_plus
 
 import requests
@@ -65,6 +65,19 @@ _HTTP_SESSION_LOCAL = threading.local()
 DEFAULT_BILL_TERM_SCOPE = "recent"
 
 
+def merge_unique_messages(left: Optional[List[str]], right: Optional[List[str]]) -> List[str]:
+    merged: List[str] = []
+    for message in list(left or []) + list(right or []):
+        text = str(message)
+        if text and text not in merged:
+            merged.append(text)
+    return merged
+
+
+def bool_or(left: Optional[bool], right: Optional[bool]) -> bool:
+    return bool(left) or bool(right)
+
+
 class MemberActivityState(TypedDict, total=False):
     member_name: str
     assembly_terms: List[int]
@@ -97,7 +110,7 @@ class MemberActivityState(TypedDict, total=False):
     enable_cosponsor_scan: bool
     show_progress: bool
     progress_callback: Any
-    llm_quota_exhausted: bool
+    llm_quota_exhausted: Annotated[bool, bool_or]
     member_info: List[Dict[str, Any]]
     sponsored_bills: List[Dict[str, Any]]
     representative_bills: List[Dict[str, Any]]
@@ -137,7 +150,7 @@ class MemberActivityState(TypedDict, total=False):
     activity_briefing_source: str
     profile_summary: str
     summary: str
-    errors: List[str]
+    errors: Annotated[List[str], merge_unique_messages]
 
 
 def sanitize_error(error: Exception | str) -> str:
@@ -2746,14 +2759,28 @@ def build_member_activity_graph(client: AssemblyAPIClient):
     workflow.add_node("summarize_member_activity", summarize_node)
     workflow.add_edge(START, "normalize_user_request")
     workflow.add_edge("normalize_user_request", "get_member_info")
+
+    # Fan-out after member metadata is available. These branches read the same
+    # normalized member state but do not depend on each other's outputs.
     workflow.add_edge("get_member_info", "search_member_bills")
+    workflow.add_edge("get_member_info", "get_all_member_votes")
+    workflow.add_edge("get_member_info", "search_recent_member_news")
+
     workflow.add_edge("search_member_bills", "analyze_legislative_interests")
-    workflow.add_edge("analyze_legislative_interests", "analyze_cosponsor_network")
-    workflow.add_edge("analyze_cosponsor_network", "get_all_member_votes")
+    workflow.add_edge("search_member_bills", "analyze_cosponsor_network")
+
     workflow.add_edge("get_all_member_votes", "analyze_party_alignment")
     workflow.add_edge("analyze_party_alignment", "interpret_vote_statistics")
-    workflow.add_edge("interpret_vote_statistics", "search_recent_member_news")
-    workflow.add_edge("search_recent_member_news", "generate_activity_briefing")
+
+    workflow.add_edge(
+        [
+            "analyze_legislative_interests",
+            "analyze_cosponsor_network",
+            "interpret_vote_statistics",
+            "search_recent_member_news",
+        ],
+        "generate_activity_briefing",
+    )
     workflow.add_edge("generate_activity_briefing", "summarize_member_activity")
     workflow.add_edge("summarize_member_activity", END)
     return workflow.compile()
