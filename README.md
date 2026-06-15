@@ -1,6 +1,6 @@
 # 🕵️‍♂️ assembly-member_LangGraph-tracker
 
-**LangGraph 기반 대한민국 국회의원 의정활동 추적 AI 에이전트**
+**LangGraph 기반 대한민국 국회의원 의정활동 추적 에이전트 워크플로우**
 
 > LangGraph 기반 국회의원 의정활동 분석 웹으로, 열린국회정보 API 등을 주로 활용해 발의법안, 표결, 정당 일치도, 공동발의 네트워크, 최근 이슈를 분석합니다.  
 
