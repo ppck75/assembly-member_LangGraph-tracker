@@ -242,6 +242,26 @@ def render_theoretical_background_sidebar() -> None:
     st.divider()
     st.subheader("📚 이론 배경")
 
+    with st.expander("🏛️ 의정활동이란?", expanded=False):
+        st.markdown(
+            """
+의정활동은 국회의원이 헌법적 권한을 바탕으로 개별적인 자율성과 개성을 발휘하여 원내외 활동을 수행하고, 국가와 국민 사이를 매개하여 사회적 합의를 도출해가는 과정입니다.
+
+📌참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
+            """
+        )
+
+    with st.expander("🗂️ 의정활동 기록의 의미", expanded=False):
+        st.markdown(
+            """
+국회의정활동 기록은 국가와 지역에 관련된 다양하고 복합적인 사회적 현안·의제를 포함하는 동시에 의원의 관점과 개성이 연결된 결과물입니다.
+
+따라서 발의법안이나 표결 기록은 단순한 행정 데이터를 넘어서 의원이 어떤 의제에 관심을 두고 어떤 판단을 반복해왔는지 보여주는 기록으로 볼 수 있습니다.
+
+📌참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
+            """
+        )
+
     with st.expander("🗣️ 공론장과 정치 커뮤니케이션", expanded=False):
         st.markdown(
             """
@@ -251,7 +271,7 @@ def render_theoretical_background_sidebar() -> None:
 
 - 이 웹은 단순한 정보 조회 서비스를 넘어, 제도정치와 시민사회 사이의 정보 격차를 줄이는 정치 커뮤니케이션 도구입니다.
 
-참고: Habermas(2006), 「Political Communication in Media Society:
+📌참고: Habermas(2006), 「Political Communication in Media Society:
 Does Democracy Still Enjoy an Epistemic
 Dimension? The Impact of Normative
 Theory on Empirical Research」
@@ -269,27 +289,7 @@ Theory on Empirical Research」
   - 언론인은 표결 이탈, 불참 비중, 반복적 공동발의 관계, 특정 정책 분야에 집중된 입법 활동을 확인해 후속 취재의 단서를 얻을 수 있습니다.
   - 참여 민주주의와 숙의 민주주의 관점에서, 이 웹은 산재된 의정활동 데이터를 시민이 이해할 수 있는 쟁점 중심 정보로 재구성하여 시민과 언론인의 근거 있는 정치적 토론을 돕습니다.
 
-참고: Strömbäck(2005), 「In Search of a Standard: Four Models of Democracy and Their Normative Implications for Journalism」
-            """
-        )
-
-    with st.expander("🏛️ 의정활동이란?", expanded=False):
-        st.markdown(
-            """
-의정활동은 국회의원이 헌법적 권한을 바탕으로 개별적인 자율성과 개성을 발휘하여 원내외 활동을 수행하고, 국가와 국민 사이를 매개하여 사회적 합의를 도출해가는 과정입니다.
-
-참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
-            """
-        )
-
-    with st.expander("🗂️ 의정활동 기록의 의미", expanded=False):
-        st.markdown(
-            """
-국회의정활동 기록은 국가와 지역에 관련된 다양하고 복합적인 사회적 현안·의제를 포함하는 동시에 의원의 관점과 개성이 연결된 결과물입니다.
-
-따라서 발의법안이나 표결 기록은 단순한 행정 데이터를 넘어서 의원이 어떤 의제에 관심을 두고 어떤 판단을 반복해왔는지 보여주는 기록으로 볼 수 있습니다.
-
-참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
+📌참고: Strömbäck(2005), 「In Search of a Standard: Four Models of Democracy and Their Normative Implications for Journalism」
             """
         )
 
@@ -304,7 +304,7 @@ Theory on Empirical Research」
 - 지역구민을 넘어 국민 전체를 대표하는 대표자
 - 정당 당원으로서 정당정치에 참여하는 행위자
 
-참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
+📌참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
 
             """
         )
