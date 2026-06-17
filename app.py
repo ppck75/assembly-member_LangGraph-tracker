@@ -251,9 +251,26 @@ def render_theoretical_background_sidebar() -> None:
 
 - 이 웹은 단순한 정보 조회 서비스를 넘어, 제도정치와 시민사회 사이의 정보 격차를 줄이는 정치 커뮤니케이션 도구입니다.
 
-참고: Habermas(2006), 「Political communication in media society」
+참고: Habermas(2006), 「Political Communication in Media Society:
+Does Democracy Still Enjoy an Epistemic
+Dimension? The Impact of Normative
+Theory on Empirical Research」
 
 https://doi.org/10.1111/j.1468-2885.2006.00280.x
+            """
+        )
+
+    with st.expander("📰 감시저널리즘과 민주적 책임성", expanded=False):
+        st.markdown(
+            """
+- Strömbäck(2005)은 민주주의와 저널리즘의 관계를 사회계약으로 설명합니다. 민주주의는 정보의 흐름, 공적 토론, 독립적인 권력 감시 기능을 필요로 하며, 저널리즘은 시민의 자율적 판단을 위한 정보를 제공하고 권력 남용을 감시합니다.
+
+- 이 웹은 감시저널리즘의 실천을 보조하고, 민주적 책임성과 근거 있는 정치적 토론을 강화하는 정치 커뮤니케이션 도구입니다.
+  - 시민은 의원의 이미지나 정쟁적 발언이 아니라 객관적 자료를 바탕으로 의정활동을 평가할 수 있습니다.
+  - 언론인은 표결 이탈, 불참 비중, 반복적 공동발의 관계, 특정 정책 분야에 집중된 입법 활동을 확인해 후속 취재의 단서를 얻을 수 있습니다.
+  - 참여 민주주의와 숙의 민주주의 관점에서, 이 웹은 산재된 의정활동 데이터를 시민이 이해할 수 있는 쟁점 중심 정보로 재구성하여 시민과 언론인의 근거 있는 정치적 토론을 돕습니다.
+
+참고: Strömbäck(2005), 「In Search of a Standard: Four Models of Democracy and Their Normative Implications for Journalism」
             """
         )
 
