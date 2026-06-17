@@ -256,7 +256,6 @@ Does Democracy Still Enjoy an Epistemic
 Dimension? The Impact of Normative
 Theory on Empirical Research」
 
-https://doi.org/10.1111/j.1468-2885.2006.00280.x
             """
         )
 
