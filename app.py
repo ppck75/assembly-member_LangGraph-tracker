@@ -394,7 +394,6 @@ def render_member_directory_panel(*, key_prefix: str = "member_directory") -> No
     with search_col:
         query = st.text_input(
             "이름·지역·위원회 검색",
-            placeholder="예: 이준석, 경기, 법제사법위원회",
             key=f"{key_prefix}_query",
         )
     with party_col:
