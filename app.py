@@ -238,6 +238,55 @@ def render_alignment_method_note() -> None:
         )
 
 
+def render_theoretical_background_sidebar() -> None:
+    st.divider()
+    st.subheader("📚 이론 배경")
+
+    with st.expander("🏛️ 의정활동이란?", expanded=False):
+        st.markdown(
+            """
+의정활동은 국회의원이 헌법적 권한을 바탕으로 개별적인 자율성과 개성을 발휘하여 원내외 활동을 수행하고, 국가와 국민 사이를 매개하여 사회적 합의를 도출해가는 과정입니다.
+
+참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
+            """
+        )
+
+    with st.expander("🗂️ 의정활동 기록의 의미", expanded=False):
+        st.markdown(
+            """
+국회의정활동 기록은 국가와 지역에 관련된 다양하고 복합적인 사회적 현안·의제를 포함하는 동시에 의원의 관점과 개성이 연결된 결과물입니다.
+
+따라서 발의법안이나 표결 기록은 단순한 행정 데이터를 넘어서 의원이 어떤 의제에 관심을 두고 어떤 판단을 반복해왔는지 보여주는 기록으로 볼 수 있습니다.
+
+참고: 이재윤·김의진·박태선(2024), 「국회의원 의정활동 기록의 개념과 특성에 관한 고찰」
+            """
+        )
+
+    with st.expander("⚖️ 국회의원의 복합적 지위", expanded=False):
+        st.markdown(
+            """
+국회의원은 단순히 개인 정치인이 아니라 복합적 지위를 가진 행위자입니다.
+
+국회의원은 헌법상 다음과 같은 세 가지 지위를 가집니다.
+
+- 국회라는 합의체 결정기관의 구성원
+- 지역구민을 넘어 국민 전체를 대표하는 대표자
+- 정당 당원으로서 정당정치에 참여하는 행위자
+            """
+        )
+
+    with st.expander("🤝 정당 다수 입장 일치도의 중요성", expanded=False):
+        st.markdown(
+            """
+국회의원은 자신의 활동을 통해 당론을 직접 만들어가는 주체인 동시에 그 당론을 지침 삼아 정당과 발맞추어 활동하는 존재이므로, 의원 개인의 소신과 정당의 전략은 서로 떼려야 뗄 수 없이 긴밀하게 연결되어 있습니다.
+
+따라서 국회의원의 의정활동을 제대로 이해하기 위해서는 개별 의원의 표결이 단순한 개인 선택인지, 정당 다수 입장과의 결속 속에서 이루어진 선택인지 함께 살펴볼 필요가 있습니다.
+
+`정당 다수 입장 일치도 분석`은 의원의 표결이 같은 정당의 다수 입장과 얼마나 일치하거나 이탈하는지를 보여줌으로써, 국회의원의 의정활동이 개인적 판단과 정당정치의 관계 속에서 어떻게 형성되는지 파악하도록 도울 수 있습니다.
+            """
+        )
+
+
 def toggle_directory_member(member_name: str, member_key: str) -> None:
     if st.session_state.get("selected_directory_member_key") == member_key:
         st.session_state["member_name_input"] = ""
@@ -1002,6 +1051,11 @@ def render_cosponsor_network_section(result: Dict[str, Any]) -> None:
 
     st.subheader("공동발의 네트워크")
     st.caption("대상 의원을 중심으로 같은 법안에 함께 이름이 등장한 공동발의 파트너를 연결한 1차 ego-network입니다.")
+    st.info(
+        "참고: 국회의원이 법률안을 발의하려면 의원 10인 이상의 찬성이 필요합니다. "
+        "이 발의 명단은 보통 대표발의자와 공동발의자로 구성되므로, 공동발의 네트워크는 "
+        "법안 발의 요건을 충족하는 과정에서 함께 이름을 올린 의원들의 입법 협력 관계를 보여줍니다."
+    )
     if not partners:
         st.info("공동발의 네트워크 데이터가 없습니다. 발의법안 조회 범위가 좁거나 공동발의자 문자열을 확인할 수 없는 경우입니다.")
         return
@@ -1704,6 +1758,7 @@ with st.sidebar:
         max_vote_bills = int(vote_detail_limit)
 
     run_button = st.button("분석 시작", type="primary", use_container_width=True)
+    render_theoretical_background_sidebar()
 
 options = {
     "party_alignment_vote_limit": int(party_alignment_limit),
