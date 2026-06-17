@@ -161,6 +161,83 @@ def render_vote_fetch_status_text(title: str, rows: Iterable[Dict[str, Any]]) ->
         )
 
 
+def render_alignment_summary_text(title: str, rows: Iterable[Dict[str, Any]]) -> None:
+    st.subheader(title)
+    summary_rows = list(rows or [])
+    if not summary_rows:
+        st.info("정당 다수 입장 일치 분석 요약 데이터가 없습니다.")
+        return
+
+    for row in summary_rows:
+        age = row.get("AGE", "-")
+        analyzed = as_int(row.get("분석표결"))
+        matched = as_int(row.get("일치"))
+        dissented = as_int(row.get("이탈"))
+        absent = as_int(row.get("불참"))
+        excluded = as_int(row.get("판정제외"))
+        match_rate = row.get("일치율", "-")
+        match_rate_with_absent = row.get("불참포함일치율", "-")
+        st.markdown(
+            f"- **{age}대**: 분석표결 **{analyzed:,}건** · "
+            f"일치 {matched:,}건 / 이탈 {dissented:,}건 / 불참 {absent:,}건 / "
+            f"판정 제외 {excluded:,}건 "
+            f"(일치율 {match_rate}, 불참 포함 {match_rate_with_absent})"
+        )
+
+
+def render_alignment_fetch_status_text(title: str, rows: Iterable[Dict[str, Any]]) -> None:
+    st.subheader(title)
+    status_rows = list(rows or [])
+    if not status_rows:
+        st.info("정당 일치도 분석 상태 데이터가 없습니다.")
+        return
+
+    total_targets = sum(as_int(row.get("분석대상표결")) for row in status_rows)
+    total_cache_hits = sum(as_int(row.get("BILL_ID캐시적중")) for row in status_rows)
+    total_api_targets = sum(as_int(row.get("API신규조회대상")) for row in status_rows)
+    total_success = sum(as_int(row.get("상세조회성공")) for row in status_rows)
+    total_failed = sum(as_int(row.get("상세조회실패")) for row in status_rows)
+    total_completed = sum(as_int(row.get("분석완료")) for row in status_rows)
+    st.markdown(
+        f"정당 일치도 분석 대상 **{total_targets:,}건** 중 "
+        f"캐시 적중 **{total_cache_hits:,}건**, 신규 API 조회 대상 **{total_api_targets:,}건**입니다. "
+        f"상세조회는 **{total_success:,}건 성공**, **{total_failed:,}건 실패**, "
+        f"분석 완료 **{total_completed:,}건**입니다."
+    )
+
+    for row in status_rows:
+        age = row.get("AGE", "-")
+        st.markdown(
+            f"- **{age}대**: 분석대상 {as_int(row.get('분석대상표결')):,}건 / "
+            f"캐시적중 {as_int(row.get('BILL_ID캐시적중')):,}건 / "
+            f"신규조회대상 {as_int(row.get('API신규조회대상')):,}건 / "
+            f"상세조회 성공 {as_int(row.get('상세조회성공')):,}건 / "
+            f"실패 {as_int(row.get('상세조회실패')):,}건 / "
+            f"분석완료 {as_int(row.get('분석완료')):,}건"
+        )
+
+
+def render_alignment_method_note() -> None:
+    with st.expander("정당 일치도 계산 방식 보기", expanded=False):
+        st.markdown(
+            """
+**정당 다수 입장**은 공식적인 당론이 아니라, 같은 정당 소속 의원들이 해당 표결에서 실제로 가장 많이 선택한 표결값을 뜻합니다.
+
+계산 방식은 다음과 같습니다.
+
+1. 분석 대상 의안의 `BILL_ID`를 기준으로 의원별 본회의 표결정보를 조회합니다.
+2. 해당 의원의 표결값을 `찬성`, `반대`, `기권`, `불참`으로 정규화합니다.
+3. 같은 정당 의원들의 표결값을 모아 `찬성/반대/기권/불참` 분포를 계산합니다.
+4. 정당 다수 입장은 `찬성/반대/기권` 중 가장 많은 값으로 정합니다. 불참은 다수 입장 계산에서 제외합니다.
+5. 대상 의원의 표결이 정당 다수 입장과 같으면 `일치`, 다르면 `이탈`로 분류합니다.
+6. 대상 의원이 불참한 표결은 `불참`으로 분류합니다.
+7. 무소속, 정당 내 유효 표결 없음, 찬성/반대/기권 동률처럼 다수 입장을 정하기 어려운 경우는 `판정 제외`로 분리합니다.
+
+따라서 이 지표는 “공식 당론 준수율”이 아니라 **같은 정당 의원들의 실제 표결 다수 흐름과 얼마나 비슷하게 투표했는지**를 보는 참고 지표입니다.
+            """
+        )
+
+
 def toggle_directory_member(member_name: str, member_key: str) -> None:
     if st.session_state.get("selected_directory_member_key") == member_key:
         st.session_state["member_name_input"] = ""
@@ -503,6 +580,8 @@ def clean_vote_interpretation_text(value: Any) -> str:
         stripped = line.strip()
         heading_text = stripped.lstrip("#").strip()
         if heading_text in {"표결 통계 해석 시 주의할 점"}:
+            continue
+        if "정당 다수 입장" in stripped and ("공식 당론" in stripped or "공식적인 당론" in stripped):
             continue
         lines.append(line)
     return "\n".join(lines).strip()
@@ -1358,14 +1437,13 @@ def render_alignment_tab(result: Dict[str, Any]) -> None:
         c3.metric("불참", f"{metric_value(summary, '불참'):,}건")
         c4.metric("판정 제외", f"{metric_value(summary, '판정제외'):,}건")
 
-    summary_cols = ["AGE", "분석표결", "일치", "이탈", "불참", "판정제외", "일치율", "불참포함일치율"]
-    stat_cols = ["AGE", "분석대상표결", "BILL_ID캐시적중", "API신규조회대상", "상세조회성공", "상세조회실패", "분석완료"]
     record_cols = ["분류", "AGE", "VOTE_DATE", "BILL_NO", "BILL_NAME", "정당", "의원표결", "정당다수입장", "정당내분포", "제외사유"]
 
     render_alignment_summary_charts(result)
+    render_alignment_method_note()
     st.divider()
-    render_dataframe("정당 다수 입장 일치 분석 요약", summary, summary_cols, height=180)
-    render_dataframe("정당 일치도 분석 상태", result.get("party_alignment_fetch_stats", []), stat_cols, height=180)
+    render_alignment_summary_text("정당 다수 입장 일치 분석 요약", summary)
+    render_alignment_fetch_status_text("정당 일치도 분석 상태", result.get("party_alignment_fetch_stats", []))
 
     with st.expander("정당 다수 입장 이탈 표결", expanded=True):
         render_dataframe("이탈 표결", result.get("party_alignment_dissent_votes", []), record_cols)
@@ -1406,8 +1484,8 @@ def render_alignment_tab(result: Dict[str, Any]) -> None:
     if st.session_state.get("alignment_update"):
         st.info("아래는 방금 실행한 정당 일치도 재분석 결과입니다.")
         update = st.session_state["alignment_update"]
-        render_dataframe("재분석 요약", update.get("party_alignment_summary", []), summary_cols, height=180)
-        render_dataframe("재분석 상태", update.get("party_alignment_fetch_stats", []), stat_cols, height=180)
+        render_alignment_summary_text("재분석 요약", update.get("party_alignment_summary", []))
+        render_alignment_fetch_status_text("재분석 상태", update.get("party_alignment_fetch_stats", []))
         updated_vote_interpretation_text = clean_vote_interpretation_text(update.get("vote_interpretation_analysis"))
         if updated_vote_interpretation_text:
             st.markdown("#### 재분석 표결 통계 해석 시 주의할 점")
