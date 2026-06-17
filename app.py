@@ -38,7 +38,7 @@ from src.streamlit_runtime import get_client, get_member_activity_app
 
 
 st.set_page_config(
-    page_title="국회의원 활동 추적",
+    page_title="국회의원 의정활동 추적",
     page_icon="🕵️‍♂️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1568,7 +1568,7 @@ def render_result(result: Dict[str, Any]) -> None:
         render_raw_tab(result)
 
 
-st.title("🕵️‍♂️국회의원 활동 추적")
+st.title("🕵️‍♂️국회의원 의정활동 추적")
 st.caption("열린국회정보 API와 LangGraph를 이용해 의원의 발의법안, 표결, 정당 다수 입장 일치도, 최근 이슈를 조회합니다.")
 
 if "member_name_input" not in st.session_state:

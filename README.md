@@ -162,7 +162,7 @@
 ### 🔄 9. LangGraph 기반 AI 에이전트 워크플로우
 
 <p align="center">
-  <img src="assets/output.png" alt="LangGraph 의원 활동 추적 에이전트 워크플로우" width="820">
+  <img src="assets/output.png" alt="LangGraph 국회의원 의정활동 추적 에이전트 워크플로우" width="820">
 </p>
 
 의원 기본정보를 먼저 확인한 뒤, 발의법안·표결·최근 이슈 수집을 병렬로 실행하고 마지막에 핵심 브리핑으로 병합하는 구조입니다.
