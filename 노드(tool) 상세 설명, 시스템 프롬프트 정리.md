@@ -2,9 +2,9 @@
 
 ## 1. 프로젝트 개요
 
-이 프로젝트는 사용자가 국회의원 이름을 입력하면 해당 의원의 기본정보, 발의법안, 공동발의 네트워크, 본회의 표결 기록, 정당 다수 입장 일치도, 최근 뉴스 이슈를 순차적으로 분석하는 LangGraph 기반 AI 에이전트이다.
+이 프로젝트는 사용자가 국회의원 이름을 입력하면 해당 의원의 기본정보를 먼저 확인한 뒤, 발의법안, 본회의 표결 기록, 최근 뉴스 이슈를 병렬로 수집하고, 마지막에 공동발의 네트워크, 정당 다수 입장 일치도, 핵심 브리핑을 종합하는 LangGraph 기반 AI 에이전트이다.
 
-주요 구현 파일은 `src/member_activity_workflow.py`이며, Streamlit 앱의 실행 진입점은 `app.py`이다. 실제 워크플로우는 `StateGraph(MemberActivityState)`로 구성되어 있고, 각 단계는 독립된 노드로 분리되어 있다.
+주요 구현 파일은 `src/member_activity_workflow.py`이며, Streamlit 앱의 실행 진입점은 `app.py`이다. 실제 워크플로우는 `StateGraph(MemberActivityState)`로 구성되어 있고, 각 단계는 독립된 노드로 분리되어 있다. 서로의 산출물을 기다릴 필요가 없는 노드는 fan-out/fan-in 방식으로 병렬 실행된다.
 
 사용 LLM 모델은 코드 기준 `gemini-2.5-flash-lite`로 고정되어 있다.
 
@@ -14,7 +14,7 @@ DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
 
 ## 2. 구현한 Tool 종류와 기능
 
-이 프로젝트에서 tool은 LangGraph 노드와 외부 데이터 호출 기능을 포함한다. 각 tool은 LLM이 임의로 순서를 정하는 방식이 아니라, LangGraph의 정해진 edge 순서에 따라 실행된다.
+이 프로젝트에서 tool은 LangGraph 노드와 외부 데이터 호출 기능을 포함한다. 각 tool은 LLM이 임의로 순서를 정하는 방식이 아니라, LangGraph의 정해진 edge와 의존 관계에 따라 실행된다. 독립적인 데이터 수집·분석 노드는 병렬 실행되고, 필요한 결과가 모두 모인 뒤 fan-in 노드에서 종합된다.
 
 ### 2.1 입력 정리 Tool
 
@@ -162,27 +162,55 @@ DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"
 - 앞선 모든 노드의 결과를 모아 최종 Markdown 요약을 생성한다.
 - 의원 프로필, 조회 범위, 발의법안 요약, 공동발의 네트워크, 표결 요약, 정당 일치도, 최근 이슈, 오류 메시지를 정리한다.
 
-## 3. LangGraph 워크플로우 순서
+## 3. LangGraph 워크플로우 구조와 병렬 처리 조건
 
-`src/member_activity_workflow.py`의 `build_member_activity_graph` 기준 실행 순서는 다음과 같다.
+`src/member_activity_workflow.py`의 `build_member_activity_graph` 기준 현재 워크플로우는 단순 직렬 구조가 아니라 fan-out/fan-in 병렬 구조이다.
+
+### 3.1 전체 실행 구조
 
 ```text
 START
 -> normalize_user_request
 -> get_member_info
--> search_member_bills
--> analyze_legislative_interests
--> analyze_cosponsor_network
--> get_all_member_votes
--> analyze_party_alignment
--> interpret_vote_statistics
--> search_recent_member_news
+
+get_member_info 이후 병렬 fan-out:
+├─ search_member_bills
+│  ├─ analyze_legislative_interests
+│  └─ analyze_cosponsor_network
+├─ get_all_member_votes
+│  └─ analyze_party_alignment
+│     └─ interpret_vote_statistics
+└─ search_recent_member_news
+
+fan-in:
+analyze_legislative_interests
+analyze_cosponsor_network
+interpret_vote_statistics
+search_recent_member_news
 -> generate_activity_briefing
 -> summarize_member_activity
 -> END
 ```
 
-각 노드는 `MemberActivityState`를 공유하며, 이전 노드의 결과를 다음 노드가 사용한다.
+### 3.2 병렬 처리 조건
+
+병렬화 기준은 **서로의 산출물을 기다릴 필요가 없는 작업만 동시에 실행**하는 것이다. 현재 병렬 처리 조건은 다음과 같다.
+
+| 구간 | 병렬 실행 노드 | 병렬 가능한 이유 |
+|---|---|---|
+| 의원 기본정보 조회 이후 | `search_member_bills`, `get_all_member_votes`, `search_recent_member_news` | 세 노드는 모두 의원명, 정당, 재임 대수 등 기본정보만 필요하며 서로의 결과를 필요로 하지 않는다. |
+| 발의법안 조회 이후 | `analyze_legislative_interests`, `analyze_cosponsor_network` | 두 노드는 모두 발의법안 조회 결과를 입력으로 사용하지만, 서로의 분석 결과는 필요로 하지 않는다. |
+| 표결 상세 조회 이후 | `analyze_party_alignment` → `interpret_vote_statistics` | 정당 일치도는 표결 상세 조회 결과가 필요하므로 병렬화하지 않고 순차 실행한다. 표결 해석 메모도 정당 일치도 결과를 함께 사용하므로 그 이후 실행한다. |
+| 최종 종합 | `generate_activity_briefing` | 입법 관심 분야, 공동발의 네트워크, 표결 해석, 최근 뉴스 결과가 모두 모인 뒤 실행되는 fan-in 노드이다. |
+
+### 3.3 상태 공유와 병합
+
+각 노드는 `MemberActivityState`를 공유한다. 병렬 노드들이 동시에 같은 상태 키를 갱신할 수 있는 경우에는 충돌을 막기 위해 reducer를 적용한다.
+
+- `errors`: 여러 병렬 노드가 오류 메시지를 추가할 수 있으므로 `merge_unique_messages`로 중복 없이 병합한다.
+- `llm_quota_exhausted`: 여러 LLM 노드 중 하나라도 quota 초과를 감지하면 전체 상태에 반영되도록 `bool_or`로 병합한다.
+
+이 구조 덕분에 발의법안 조회, 표결 조회, 최근 뉴스 검색처럼 독립적인 작업은 동시에 진행하면서도, 최종 브리핑은 필요한 중간 결과가 모두 준비된 뒤 안정적으로 생성된다.
 
 ## 4. 실제 작성한 System Prompt
 
