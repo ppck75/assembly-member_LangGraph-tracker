@@ -1116,7 +1116,7 @@ def render_cosponsor_network_section(result: Dict[str, Any]) -> None:
         {"name": "당외", "value": as_int(summary.get("당외협업"))},
         {"name": "정당 미확인", "value": as_int(summary.get("정당미확인협업"))},
     ]
-    left_chart, right_note = st.columns([0.55, 0.45])
+    left_chart, _right_spacer = st.columns([0.55, 0.45])
     with left_chart:
         if chart_has_data(party_data):
             option = base_chart_option()
@@ -1136,11 +1136,10 @@ def render_cosponsor_network_section(result: Dict[str, Any]) -> None:
                 }
             )
             render_echarts("정당 내/외 협업 비중", option, height=300)
-    with right_note:
-        st.info(
-            "정당 색상 기준: 초록은 당내, 주황은 당외, 보라는 정당 미확인입니다. "
-            "정당 매칭은 의원 목록 API의 현재/최근 정당명을 기준으로 하므로 발의 당시 정당과 다를 수 있습니다."
-        )
+            st.caption(
+                "정당 색상 기준: 초록은 당내, 주황은 당외, 보라는 정당 미확인입니다. "
+                "정당 매칭은 의원 목록 API의 현재/최근 정당명을 기준으로 하므로 발의 당시 정당과 다를 수 있습니다."
+            )
 
     committee_options = ["전체"] + [str(row.get("소관위원회")) for row in committees if row.get("소관위원회")]
     selected_committee = st.selectbox(
