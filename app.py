@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import html
 import io
 import json
@@ -52,6 +53,23 @@ APP_PARTY_ALIGNMENT_SLIDER_MAX = 500
 MEMBER_DIRECTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 MEMBER_DIRECTORY_PAGE_SIZE = 9
 APP_DEFAULT_BILL_TERM_SCOPE = "recent"
+ALIGNMENT_RESULT_KEYS = [
+    "party_alignment_vote_limit",
+    "party_alignment_summary",
+    "party_alignment_records",
+    "party_alignment_dissent_votes",
+    "party_alignment_excluded_votes",
+    "party_alignment_fetch_stats",
+    "vote_interpretation_context",
+    "vote_interpretation_analysis",
+    "vote_interpretation_analysis_source",
+    "llm_quota_exhausted",
+]
+
+
+@st.cache_resource(show_spinner=False)
+def get_alignment_reanalysis_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="party-alignment-reanalysis")
 
 
 @st.cache_data(ttl=MEMBER_DIRECTORY_CACHE_TTL_SECONDS, show_spinner=False)
@@ -847,6 +865,70 @@ def run_analysis(member_name: str, options: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def run_party_alignment_reanalysis_job(client: Any, state: Dict[str, Any]) -> Dict[str, Any]:
+    update = make_analyze_party_alignment_node(client)(state)
+    interpretation = analyze_vote_interpretation_node({**state, **update})
+    return {**update, **interpretation}
+
+
+def start_party_alignment_reanalysis(result: Dict[str, Any], limit: int) -> None:
+    state = {
+        **result,
+        "party_alignment_vote_limit": int(limit),
+        "errors": [],
+        "show_progress": False,
+    }
+    state.pop("progress_callback", None)
+    future = get_alignment_reanalysis_executor().submit(run_party_alignment_reanalysis_job, get_client(), state)
+    st.session_state["alignment_reanalysis_future"] = future
+    st.session_state["alignment_reanalysis_limit"] = int(limit)
+    st.session_state["alignment_reanalysis_status"] = "running"
+    st.session_state["alignment_reanalysis_message"] = (
+        f"정당 일치도만 최근 {int(limit):,}건 기준으로 재계산하고 있습니다. "
+        "발의법안, 표결 목록, 최근 이슈는 다시 조회하지 않습니다."
+    )
+
+
+def merge_party_alignment_update(result: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(result)
+    for key in ALIGNMENT_RESULT_KEYS:
+        if key in update:
+            merged[key] = update[key]
+
+    existing_errors = list(result.get("errors", []) or [])
+    new_errors = [error for error in list(update.get("errors", []) or []) if error not in existing_errors]
+    if new_errors:
+        merged["errors"] = existing_errors + new_errors
+    elif "errors" in result:
+        merged["errors"] = existing_errors
+
+    merged["_alignment_reanalysis_last_limit"] = update.get(
+        "party_alignment_vote_limit",
+        st.session_state.get("alignment_reanalysis_limit"),
+    )
+    return merged
+
+
+def apply_completed_party_alignment_reanalysis() -> None:
+    future = st.session_state.get("alignment_reanalysis_future")
+    if not isinstance(future, Future) or not future.done():
+        return
+
+    try:
+        update = future.result()
+    except Exception as error:
+        st.session_state["alignment_reanalysis_status"] = "error"
+        st.session_state["alignment_reanalysis_message"] = f"정당 일치도 재분석 중 오류가 발생했습니다: {error}"
+    else:
+        result = st.session_state.get("member_activity_result")
+        if isinstance(result, dict):
+            st.session_state["member_activity_result"] = merge_party_alignment_update(result, update)
+        st.session_state["alignment_reanalysis_status"] = "complete"
+        st.session_state["alignment_reanalysis_message"] = "정당 일치도 재분석이 완료되어 현재 정당 일치도 탭에 반영되었습니다."
+    finally:
+        st.session_state.pop("alignment_reanalysis_future", None)
+
+
 def render_summary_kpis(result: Dict[str, Any]) -> None:
     alignment_summary = result.get("party_alignment_summary", [])
     aligned = metric_value(alignment_summary, "일치")
@@ -1517,6 +1599,8 @@ def render_votes_tab(result: Dict[str, Any]) -> None:
 
 
 def render_alignment_tab(result: Dict[str, Any]) -> None:
+    apply_completed_party_alignment_reanalysis()
+    result = st.session_state.get("member_activity_result", result)
     summary = result.get("party_alignment_summary", [])
     if summary:
         c1, c2, c3, c4 = st.columns(4)
@@ -1540,7 +1624,24 @@ def render_alignment_tab(result: Dict[str, Any]) -> None:
 
     st.divider()
     st.subheader("정당 일치도 범위 재분석")
-    st.caption("초기 조회된 표결 대수 안에서 최근 N건 기준으로 정당 일치도만 다시 계산합니다.")
+    st.caption("초기 조회된 표결 대수 안에서 최근 N건 기준으로 정당 일치도만 다시 계산합니다. 발의법안, 표결 목록, 최근 이슈는 다시 조회하지 않습니다.")
+    reanalysis_status = st.session_state.get("alignment_reanalysis_status")
+    reanalysis_message = st.session_state.get("alignment_reanalysis_message")
+    reanalysis_future = st.session_state.get("alignment_reanalysis_future")
+    if isinstance(reanalysis_future, Future) and not reanalysis_future.done():
+        st.info(reanalysis_message or "정당 일치도 재분석이 진행 중입니다. 다른 탭을 확인하다가 돌아와 결과를 반영할 수 있습니다.")
+        if st.button("재분석 완료 확인", type="secondary"):
+            apply_completed_party_alignment_reanalysis()
+            st.rerun()
+    elif reanalysis_status == "complete" and reanalysis_message:
+        st.success(reanalysis_message)
+    elif reanalysis_status == "error" and reanalysis_message:
+        st.error(reanalysis_message)
+
+    last_limit = result.get("_alignment_reanalysis_last_limit")
+    if last_limit:
+        st.caption(f"현재 정당 일치도 탭은 최근 {int(last_limit):,}건 기준 재분석 결과를 반영하고 있습니다.")
+
     current_limit = int(result.get("party_alignment_vote_limit", DEFAULT_PARTY_ALIGNMENT_LIMIT) or DEFAULT_PARTY_ALIGNMENT_LIMIT)
     current_limit = min(max(current_limit, 50), APP_PARTY_ALIGNMENT_SLIDER_MAX)
     limit = st.slider(
@@ -1554,30 +1655,10 @@ def render_alignment_tab(result: Dict[str, Any]) -> None:
             "값을 높이면 더 넓은 범위를 보지만 의안별 전체 표결을 추가 조회해 시간이 길어질 수 있습니다."
         ),
     )
-    if st.button("정당 일치도 재분석", type="secondary"):
-        state = {
-            **result,
-            "party_alignment_vote_limit": int(limit),
-            "errors": [],
-            "show_progress": False,
-        }
-        with st.status("정당 일치도를 재분석하고 있습니다.", expanded=True) as status:
-            update = make_analyze_party_alignment_node(get_client())(state)
-            interpretation = analyze_vote_interpretation_node({**state, **update})
-            update = {**update, **interpretation}
-            status.update(label="재분석 완료", state="complete", expanded=False)
-        st.session_state["alignment_update"] = update
+    running = isinstance(st.session_state.get("alignment_reanalysis_future"), Future)
+    if st.button("정당 일치도 재분석", type="secondary", disabled=running):
+        start_party_alignment_reanalysis(result, int(limit))
         st.rerun()
-
-    if st.session_state.get("alignment_update"):
-        st.info("아래는 방금 실행한 정당 일치도 재분석 결과입니다.")
-        update = st.session_state["alignment_update"]
-        render_alignment_summary_text("재분석 요약", update.get("party_alignment_summary", []))
-        render_alignment_fetch_status_text("재분석 상태", update.get("party_alignment_fetch_stats", []))
-        updated_vote_interpretation_text = clean_vote_interpretation_text(update.get("vote_interpretation_analysis"))
-        if updated_vote_interpretation_text:
-            st.markdown("#### 재분석 표결 통계 해석 시 주의할 점")
-            st.markdown(updated_vote_interpretation_text)
 
 
 def render_news_tab(result: Dict[str, Any]) -> None:
@@ -1813,6 +1894,10 @@ options = {
 
 if run_button:
     st.session_state.pop("alignment_update", None)
+    st.session_state.pop("alignment_reanalysis_future", None)
+    st.session_state.pop("alignment_reanalysis_limit", None)
+    st.session_state.pop("alignment_reanalysis_status", None)
+    st.session_state.pop("alignment_reanalysis_message", None)
     st.session_state.pop("additional_vote_update", None)
     if not member_name.strip():
         st.error("분석할 국회의원 이름을 입력하세요.")
@@ -1832,4 +1917,5 @@ if st.session_state.get("member_activity_result") and st.session_state["member_a
 render_member_directory_section()
 
 if st.session_state.get("member_activity_result"):
+    apply_completed_party_alignment_reanalysis()
     render_result(st.session_state["member_activity_result"])
