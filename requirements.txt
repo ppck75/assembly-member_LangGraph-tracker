@@ -1,6 +1,7 @@
 streamlit
 pandas
 requests
+httpx
 python-dotenv
 langgraph
 langchain-core

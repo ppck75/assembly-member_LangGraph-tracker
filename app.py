@@ -14,6 +14,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.member_activity_workflow import (
+    DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY,
+    DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED,
     DEFAULT_ENABLE_COSPONSOR_SCAN,
     DEFAULT_MAX_BILL_PAGES,
     DEFAULT_MAX_COSPONSOR_SCAN_PAGES,
@@ -770,6 +772,8 @@ def build_initial_state(member_name: str, options: Dict[str, Any]) -> Dict[str, 
         "enable_cosponsor_scan": options["enable_cosponsor_scan"],
         "max_cosponsor_scan_pages": options["max_cosponsor_scan_pages"],
         "member_party_lookup": options.get("member_party_lookup", {}),
+        "async_open_assembly_enabled": options.get("async_open_assembly_enabled", DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED),
+        "async_open_assembly_concurrency": options.get("async_open_assembly_concurrency", DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY),
         "show_progress": False,
     }
 
@@ -1890,6 +1894,8 @@ options = {
     "llm_insights_enabled": bool(llm_insights_enabled),
     "recent_news_enabled": bool(recent_news_enabled),
     "member_party_lookup": get_member_party_lookup_cached(),
+    "async_open_assembly_enabled": DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED,
+    "async_open_assembly_concurrency": DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY,
 }
 
 if run_button:

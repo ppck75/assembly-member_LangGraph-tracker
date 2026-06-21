@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import html
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, Iterable, List, Optional, TypedDict
 from urllib.parse import quote_plus
 
+import httpx
 import requests
 from requests.adapters import HTTPAdapter
 from langgraph.graph import END, START, StateGraph
@@ -39,6 +41,7 @@ ENDPOINT_MEMBER_VOTES = "nojepdqqaweusdfbi"  # 국회의원 본회의 표결정�
 ENDPOINT_VOTE_BILLS = "ncocpgfiaoituanbr"  # 의안별 표결현황
 ENDPOINT_MEMBERS = "ALLNAMEMBER"  # 국회의원 정보 통합 API
 HTTP_TIMEOUT = (8, 25)
+ASYNC_HTTP_TIMEOUT_SECONDS = 25.0
 HTTP_RETRY_ATTEMPTS = 3
 HTTP_RETRY_BACKOFF_SECONDS = 0.5
 NEWS_HTTP_TIMEOUT = 8
@@ -63,6 +66,8 @@ DEFAULT_MAX_COSPONSOR_SCAN_PAGES = 5
 DEFAULT_SHOW_PROGRESS = True
 _HTTP_SESSION_LOCAL = threading.local()
 DEFAULT_BILL_TERM_SCOPE = "recent"
+DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED = True
+DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY = 8
 
 
 def merge_unique_messages(left: Optional[List[str]], right: Optional[List[str]]) -> List[str]:
@@ -108,6 +113,8 @@ class MemberActivityState(TypedDict, total=False):
     max_cosponsor_scan_pages: int
     member_party_lookup: Dict[str, str]
     enable_cosponsor_scan: bool
+    async_open_assembly_enabled: bool
+    async_open_assembly_concurrency: int
     show_progress: bool
     progress_callback: Any
     llm_quota_exhausted: Annotated[bool, bool_or]
@@ -422,6 +429,93 @@ class AssemblyAPIClient:
         return rows
 
 
+@dataclass
+class AsyncAssemblyAPIClient:
+    api_key: str
+    max_connections: int = DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY
+    timeout_seconds: float = ASYNC_HTTP_TIMEOUT_SECONDS
+    _client: Optional[httpx.AsyncClient] = None
+
+    async def __aenter__(self) -> "AsyncAssemblyAPIClient":
+        limits = httpx.Limits(
+            max_connections=max(1, self.max_connections),
+            max_keepalive_connections=max(1, self.max_connections),
+        )
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout_seconds),
+            limits=limits,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def get_rows_page(self, api_res: str, params: Dict[str, Any], page: int) -> List[Dict[str, Any]]:
+        if self._client is None:
+            raise RuntimeError("AsyncAssemblyAPIClient는 async with 블록 안에서 사용해야 합니다.")
+        p_size = int(params.get("pSize", 100))
+        query_params = {key: value for key, value in params.items() if key != "pSize" and value not in (None, "")}
+        payload = {"KEY": self.api_key, "Type": "json", "pIndex": page, "pSize": p_size, **query_params}
+        last_error: Optional[Exception] = None
+        data: Any = {}
+        for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+            try:
+                response = await self._client.get(f"{BASE_URL}/{api_res}", params=payload)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as error:
+                last_error = error
+                if attempt >= HTTP_RETRY_ATTEMPTS:
+                    raise
+                await asyncio.sleep(HTTP_RETRY_BACKOFF_SECONDS * attempt)
+        else:
+            if last_error:
+                raise last_error
+        result = data.get("RESULT") if isinstance(data, dict) else None
+        if isinstance(result, dict) and normalize_space(result.get("CODE")).startswith("ERROR"):
+            raise RuntimeError(normalize_space(result.get("MESSAGE")) or normalize_space(result.get("CODE")))
+        return parse_openapi_rows(data, api_res)
+
+    async def get_rows(self, api_res: str, params: Dict[str, Any], max_pages: int = 1) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            p_size = int(params.get("pSize", 100))
+            page_rows = await self.get_rows_page(api_res, params, page)
+            if not page_rows:
+                break
+            rows.extend(page_rows)
+            if len(page_rows) < p_size:
+                break
+        return rows
+
+
+def run_async_safely(coro: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result_box: Dict[str, Any] = {}
+    error_box: Dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result_box["result"] = asyncio.run(coro)
+        except BaseException as error:
+            error_box["error"] = error
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("result")
+
+
 def dedupe_records(records: Iterable[Dict[str, Any]], key_candidates: List[str]) -> List[Dict[str, Any]]:
     seen = set()
     result: List[Dict[str, Any]] = []
@@ -709,6 +803,8 @@ def normalize_input_node(state: MemberActivityState) -> MemberActivityState:
         "recent_news_enabled": bool(state.get("recent_news_enabled", True)),
         "max_cosponsor_scan_pages": int(state.get("max_cosponsor_scan_pages") or DEFAULT_MAX_COSPONSOR_SCAN_PAGES),
         "enable_cosponsor_scan": bool(state.get("enable_cosponsor_scan", DEFAULT_ENABLE_COSPONSOR_SCAN)),
+        "async_open_assembly_enabled": bool(state.get("async_open_assembly_enabled", DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED)),
+        "async_open_assembly_concurrency": int(state.get("async_open_assembly_concurrency") or DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY),
         "show_progress": bool(state.get("show_progress", DEFAULT_SHOW_PROGRESS)),
         "progress_callback": state.get("progress_callback"),
         "llm_quota_exhausted": bool(state.get("llm_quota_exhausted", False)),
@@ -1660,6 +1756,72 @@ def fetch_member_vote_for_bill(
     return rows
 
 
+async def async_fetch_member_vote_for_bill(
+    client: AsyncAssemblyAPIClient,
+    age: int,
+    bill: Dict[str, Any],
+    member_name: str,
+    mona_codes: List[str],
+    force_refresh: bool = False,
+) -> List[Dict[str, Any]]:
+    bill_id = normalize_space(bill.get("BILL_ID"))
+    bill_no = normalize_space(bill.get("BILL_NO"))
+    if not bill_id:
+        return []
+    cache_key = [age, bill_id, normalize_space(member_name)]
+    cached = None if force_refresh else load_cache("member_vote", cache_key)
+    if cached is None and not force_refresh:
+        legacy_cache_key = [age, bill_id, member_name, ",".join(mona_codes)]
+        cached = load_cache("member_vote", legacy_cache_key)
+        if cached is not None:
+            save_cache("member_vote", cache_key, cached)
+    if cached is not None:
+        return cached
+
+    query_attempts = [{"AGE": age, "BILL_ID": bill_id, "HG_NM": member_name, "pSize": MEMBER_VOTE_TARGETED_PAGE_SIZE}]
+    query_attempts.extend(
+        {"AGE": age, "BILL_ID": bill_id, "MONA_CD": code, "pSize": MEMBER_VOTE_TARGETED_PAGE_SIZE}
+        for code in mona_codes
+    )
+
+    rows: List[Dict[str, Any]] = []
+    query_errors: List[Exception] = []
+    for query in query_attempts:
+        try:
+            page_rows = await client.get_rows(ENDPOINT_MEMBER_VOTES, query, max_pages=1)
+        except Exception as error:
+            query_errors.append(error)
+            continue
+        matched_rows = filter_member_vote_rows(page_rows, member_name, mona_codes)
+        if matched_rows:
+            rows = matched_rows
+            break
+        if page_rows and normalize_space(query.get("HG_NM")) == member_name:
+            rows = page_rows
+            break
+    if not rows and len(query_errors) == len(query_attempts) and query_errors:
+        raise query_errors[-1]
+
+    for row in rows:
+        row["_REQUEST_AGE"] = age
+        row["_VOTE_RESULT"] = normalize_vote_result(row)
+        if not normalize_space(row.get("BILL_ID")):
+            row["BILL_ID"] = bill_id
+        if not normalize_space(row.get("BILL_NO")):
+            row["BILL_NO"] = bill_no
+        if not normalize_space(row.get("BILL_NAME")):
+            row["BILL_NAME"] = bill.get("BILL_NAME", "")
+        if not normalize_space(row.get("VOTE_DATE")):
+            row["VOTE_DATE"] = bill.get("PROC_DT", "")
+        if not normalize_space(row.get("CURR_COMMITTEE")):
+            row["CURR_COMMITTEE"] = bill.get("CURR_COMMITTEE", "")
+        if not normalize_space(row.get("BILL_URL")):
+            row["BILL_URL"] = bill.get("LINK_URL", "")
+
+    save_cache("member_vote", cache_key, rows)
+    return rows
+
+
 def is_full_bill_vote_cached(age: int, bill: Dict[str, Any]) -> bool:
     bill_id = normalize_space(bill.get("BILL_ID"))
     return bool(bill_id) and is_cache_fresh("bill_votes_full_v2", [age, bill_id])
@@ -1764,6 +1926,77 @@ def fetch_all_votes_for_bill(client: AssemblyAPIClient, age: int, bill: Dict[str
     return rows
 
 
+async def async_fetch_rows_by_cached_pages(
+    client: AsyncAssemblyAPIClient,
+    api_res: str,
+    params: Dict[str, Any],
+    cache_namespace: str,
+    cache_key_prefix: List[Any],
+    max_pages: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    p_size = int(params.get("pSize", 100))
+    for page in range(1, max_pages + 1):
+        cache_key = [*cache_key_prefix, page]
+        page_rows = load_cache(cache_namespace, cache_key)
+        if page_rows is None:
+            try:
+                page_rows = await client.get_rows_page(api_res, params, page)
+            except Exception:
+                if rows:
+                    break
+                raise
+            save_cache(cache_namespace, cache_key, page_rows)
+        rows.extend(page_rows)
+        if len(page_rows) < p_size:
+            break
+    return rows
+
+
+async def async_fetch_party_votes_for_bill(client: AsyncAssemblyAPIClient, age: int, bill: Dict[str, Any], party: str) -> List[Dict[str, Any]]:
+    bill_id = normalize_space(bill.get("BILL_ID"))
+    normalized_party = normalize_party_name(party)
+    if not bill_id or not normalized_party:
+        return []
+
+    legacy_cached = load_cache("bill_votes_party_v1", [age, bill_id, normalized_party])
+    if legacy_cached is not None:
+        return legacy_cached
+
+    rows = await async_fetch_rows_by_cached_pages(
+        client,
+        ENDPOINT_MEMBER_VOTES,
+        {"AGE": age, "BILL_ID": bill_id, "POLY_NM": party, "pSize": 100},
+        "bill_votes_party_page_v1",
+        [age, bill_id, normalized_party],
+        max_pages=PARTY_ALIGNMENT_PARTY_MAX_PAGES,
+    )
+    rows = enrich_vote_rows_for_bill(rows, age, bill)
+    party_rows = [row for row in rows if normalize_party_name(party_name_from_row(row)) == normalized_party]
+    return party_rows or rows
+
+
+async def async_fetch_all_votes_for_bill(client: AsyncAssemblyAPIClient, age: int, bill: Dict[str, Any]) -> List[Dict[str, Any]]:
+    bill_id = normalize_space(bill.get("BILL_ID"))
+    if not bill_id:
+        return []
+    cached = load_cache("bill_votes_full_v2", [age, bill_id])
+    if cached is not None:
+        return cached
+
+    rows = await async_fetch_rows_by_cached_pages(
+        client,
+        ENDPOINT_MEMBER_VOTES,
+        {"AGE": age, "BILL_ID": bill_id, "pSize": 100},
+        "bill_votes_full_page_v1",
+        [age, bill_id],
+        max_pages=3,
+    )
+    rows = enrich_vote_rows_for_bill(rows, age, bill)
+    save_cache("bill_votes_full_v2", [age, bill_id], rows)
+    return rows
+
+
 def vote_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     counts = {"찬성": 0, "반대": 0, "기권": 0, "불참": 0, "미확인": 0}
     for row in rows:
@@ -1801,8 +2034,8 @@ def infer_member_party_for_age(state: MemberActivityState, age: int) -> str:
     return ""
 
 
-def analyze_party_alignment_for_bill(
-    client: AssemblyAPIClient,
+def build_party_alignment_record_for_bill(
+    vote_rows: List[Dict[str, Any]],
     age: int,
     bill: Dict[str, Any],
     member_name: str,
@@ -1810,11 +2043,6 @@ def analyze_party_alignment_for_bill(
     known_target_row: Optional[Dict[str, Any]] = None,
     target_party_hint: str = "",
 ) -> Dict[str, Any]:
-    target_party_hint = party_name_from_row(known_target_row or {}) or normalize_space(target_party_hint)
-    if normalize_party_name(target_party_hint):
-        vote_rows = fetch_party_votes_for_bill(client, age, bill, target_party_hint)
-    else:
-        vote_rows = fetch_all_votes_for_bill(client, age, bill)
     target_rows = filter_member_vote_rows(vote_rows, member_name, mona_codes)
     if not target_rows and known_target_row:
         target_rows = [known_target_row]
@@ -1879,6 +2107,56 @@ def analyze_party_alignment_for_bill(
     else:
         base["분류"] = "이탈"
     return base
+
+
+def analyze_party_alignment_for_bill(
+    client: AssemblyAPIClient,
+    age: int,
+    bill: Dict[str, Any],
+    member_name: str,
+    mona_codes: List[str],
+    known_target_row: Optional[Dict[str, Any]] = None,
+    target_party_hint: str = "",
+) -> Dict[str, Any]:
+    target_party_hint = party_name_from_row(known_target_row or {}) or normalize_space(target_party_hint)
+    if normalize_party_name(target_party_hint):
+        vote_rows = fetch_party_votes_for_bill(client, age, bill, target_party_hint)
+    else:
+        vote_rows = fetch_all_votes_for_bill(client, age, bill)
+    return build_party_alignment_record_for_bill(
+        vote_rows,
+        age,
+        bill,
+        member_name,
+        mona_codes,
+        known_target_row=known_target_row,
+        target_party_hint=target_party_hint,
+    )
+
+
+async def async_analyze_party_alignment_for_bill(
+    client: AsyncAssemblyAPIClient,
+    age: int,
+    bill: Dict[str, Any],
+    member_name: str,
+    mona_codes: List[str],
+    known_target_row: Optional[Dict[str, Any]] = None,
+    target_party_hint: str = "",
+) -> Dict[str, Any]:
+    target_party_hint = party_name_from_row(known_target_row or {}) or normalize_space(target_party_hint)
+    if normalize_party_name(target_party_hint):
+        vote_rows = await async_fetch_party_votes_for_bill(client, age, bill, target_party_hint)
+    else:
+        vote_rows = await async_fetch_all_votes_for_bill(client, age, bill)
+    return build_party_alignment_record_for_bill(
+        vote_rows,
+        age,
+        bill,
+        member_name,
+        mona_codes,
+        known_target_row=known_target_row,
+        target_party_hint=target_party_hint,
+    )
 
 
 def summarize_party_alignment_by_term(records: List[Dict[str, Any]], vote_terms: List[int]) -> List[Dict[str, Any]]:
@@ -2056,6 +2334,106 @@ def analyze_vote_interpretation_node(state: MemberActivityState) -> MemberActivi
         }
 
 
+async def async_collect_party_alignment_records(
+    api_key: str,
+    age: int,
+    vote_bills: List[Dict[str, Any]],
+    member_name: str,
+    mona_codes: List[str],
+    known_member_vote_by_bill_id: Dict[str, Dict[str, Any]],
+    target_party_hint: str,
+    concurrency: int,
+    progress_callback: Optional[Any] = None,
+) -> tuple[List[Dict[str, Any]], List[Exception]]:
+    records: List[Dict[str, Any]] = []
+    failures: List[Exception] = []
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async with AsyncAssemblyAPIClient(api_key=api_key, max_connections=max(1, concurrency)) as async_client:
+        async def run_one(bill: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+            async with semaphore:
+                try:
+                    bill_id = normalize_space(bill.get("BILL_ID"))
+                    record = await async_analyze_party_alignment_for_bill(
+                        async_client,
+                        age,
+                        bill,
+                        member_name,
+                        mona_codes,
+                        known_member_vote_by_bill_id.get(bill_id),
+                        target_party_hint,
+                    )
+                    return record, None
+                except Exception as error:
+                    return None, error
+
+        tasks = [asyncio.create_task(run_one(bill)) for bill in vote_bills]
+        completed = 0
+        for task in asyncio.as_completed(tasks):
+            completed += 1
+            record, error = await task
+            if error is not None:
+                failures.append(error)
+            elif record is not None:
+                records.append(record)
+            if progress_callback and (completed % 10 == 0 or completed == len(tasks)):
+                progress_callback(completed, len(tasks), len(records), len(failures))
+
+    return records, failures
+
+
+async def async_collect_member_votes_for_bills(
+    api_key: str,
+    age: int,
+    vote_bills: List[Dict[str, Any]],
+    member_name: str,
+    mona_codes: List[str],
+    force_refresh: bool,
+    concurrency: int,
+    progress_callback: Optional[Any] = None,
+) -> tuple[List[Dict[str, Any]], set[str], List[str], List[Exception]]:
+    rows: List[Dict[str, Any]] = []
+    success_bill_ids: set[str] = set()
+    failed_bill_ids: List[str] = []
+    failures: List[Exception] = []
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async with AsyncAssemblyAPIClient(api_key=api_key, max_connections=max(1, concurrency)) as async_client:
+        async def run_one(bill: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], Optional[Exception]]:
+            async with semaphore:
+                bill_id = normalize_space(bill.get("BILL_ID"))
+                try:
+                    member_rows = await async_fetch_member_vote_for_bill(
+                        async_client,
+                        age,
+                        bill,
+                        member_name,
+                        mona_codes,
+                        force_refresh,
+                    )
+                    return bill_id, member_rows, None
+                except Exception as error:
+                    return bill_id, [], error
+
+        tasks = [asyncio.create_task(run_one(bill)) for bill in vote_bills]
+        completed = 0
+        for task in asyncio.as_completed(tasks):
+            completed += 1
+            bill_id, member_rows, error = await task
+            if error is not None:
+                failures.append(error)
+                if bill_id:
+                    failed_bill_ids.append(bill_id)
+            else:
+                rows.extend(member_rows)
+                if bill_id:
+                    success_bill_ids.add(bill_id)
+            if progress_callback and (completed % 10 == 0 or completed == len(tasks)):
+                progress_callback(completed, len(tasks), len(success_bill_ids), len(failures))
+
+    return rows, success_bill_ids, failed_bill_ids, failures
+
+
 def build_activity_briefing_context(state: MemberActivityState) -> Dict[str, Any]:
     party_alignment_summary = state.get("party_alignment_summary", [])
     aligned = sum(int(row.get("일치", 0) or 0) for row in party_alignment_summary)
@@ -2207,6 +2585,8 @@ def make_analyze_party_alignment_node(client: AssemblyAPIClient):
         member_name = state["member_name"]
         max_pages = int(state.get("max_vote_pages") or DEFAULT_MAX_VOTE_PAGES)
         workers = max(1, int(state.get("vote_fetch_workers") or DEFAULT_VOTE_FETCH_WORKERS))
+        async_enabled = bool(state.get("async_open_assembly_enabled", DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED))
+        async_concurrency = max(1, int(state.get("async_open_assembly_concurrency") or DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY))
         limit = int(state.get("party_alignment_vote_limit", DEFAULT_PARTY_ALIGNMENT_LIMIT))
         vote_terms = state.get("vote_terms", [])
         mona_codes = member_code_candidates(state)
@@ -2220,7 +2600,8 @@ def make_analyze_party_alignment_node(client: AssemblyAPIClient):
             return {"party_alignment_summary": [], "party_alignment_records": [], "party_alignment_dissent_votes": [], "party_alignment_excluded_votes": [], "party_alignment_fetch_stats": [], "errors": errors}
 
         scope_label = "전체" if limit == 0 else f"최근 {limit}건"
-        progress_log(state, f"정당 다수 입장 일치 분석 시작: {format_terms(vote_terms)}, 대수별 {scope_label}, 병렬 {workers}개")
+        mode_label = f"비동기 {async_concurrency}개" if async_enabled else f"스레드 병렬 {workers}개"
+        progress_log(state, f"정당 다수 입장 일치 분석 시작: {format_terms(vote_terms)}, 대수별 {scope_label}, {mode_label}")
         for age in vote_terms:
             term_stat = {"AGE": age, "분석대상표결": 0, "BILL_ID캐시적중": 0, "API신규조회대상": 0, "상세조회성공": 0, "상세조회실패": 0, "분석완료": 0}
             try:
@@ -2234,34 +2615,65 @@ def make_analyze_party_alignment_node(client: AssemblyAPIClient):
                 )
                 term_stat["API신규조회대상"] = len(vote_bills) - term_stat["BILL_ID캐시적중"]
                 progress_log(state, f"{age}대 정당 일치도 정당별 표결 캐시: 적중 {term_stat['BILL_ID캐시적중']}건 / 신규조회대상 {term_stat['API신규조회대상']}건")
-                completed = 0
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [
-                        executor.submit(
-                            analyze_party_alignment_for_bill,
-                            client,
-                            age,
-                            bill,
-                            member_name,
-                            mona_codes,
-                            known_member_vote_by_bill_id.get(normalize_space(bill.get("BILL_ID"))),
-                            member_party_by_age.get(int(age), ""),
+                async_done = False
+                if async_enabled and vote_bills:
+                    try:
+                        term_records, failures = run_async_safely(
+                            async_collect_party_alignment_records(
+                                client.api_key,
+                                age,
+                                vote_bills,
+                                member_name,
+                                mona_codes,
+                                known_member_vote_by_bill_id,
+                                member_party_by_age.get(int(age), ""),
+                                async_concurrency,
+                                lambda completed, total, success, failed: progress_log(
+                                    state,
+                                    f"{age}대 정당 일치도 비동기 분석 진행: {completed}/{total} (성공 {success}, 실패 {failed})",
+                                ),
+                            )
                         )
-                        for bill in vote_bills
-                    ]
-                    for future in as_completed(futures):
-                        completed += 1
-                        try:
-                            record = future.result()
-                            records.append(record)
-                            term_stat["상세조회성공"] += 1
-                            term_stat["분석완료"] += 1
-                        except Exception as error:
-                            term_stat["상세조회실패"] += 1
-                            if term_stat["상세조회실패"] <= 3:
-                                errors.append(f"{age}대 정당 일치도 분석 실패: {sanitize_error(error)}")
-                        if completed % 10 == 0 or completed == len(futures):
-                            progress_log(state, f"{age}대 정당 일치도 분석 진행: {completed}/{len(futures)} (성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
+                        records.extend(term_records)
+                        term_stat["상세조회성공"] += len(term_records)
+                        term_stat["분석완료"] += len(term_records)
+                        term_stat["상세조회실패"] += len(failures)
+                        for error in failures[:3]:
+                            errors.append(f"{age}대 정당 일치도 분석 실패: {sanitize_error(error)}")
+                        async_done = True
+                    except Exception as error:
+                        errors.append(f"{age}대 정당 일치도 비동기 분석 실패, 동기 병렬로 재시도합니다: {sanitize_error(error)}")
+                        progress_log(state, f"{age}대 정당 일치도 비동기 분석 실패: 동기 병렬 fallback")
+
+                if not async_done:
+                    completed = 0
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [
+                            executor.submit(
+                                analyze_party_alignment_for_bill,
+                                client,
+                                age,
+                                bill,
+                                member_name,
+                                mona_codes,
+                                known_member_vote_by_bill_id.get(normalize_space(bill.get("BILL_ID"))),
+                                member_party_by_age.get(int(age), ""),
+                            )
+                            for bill in vote_bills
+                        ]
+                        for future in as_completed(futures):
+                            completed += 1
+                            try:
+                                record = future.result()
+                                records.append(record)
+                                term_stat["상세조회성공"] += 1
+                                term_stat["분석완료"] += 1
+                            except Exception as error:
+                                term_stat["상세조회실패"] += 1
+                                if term_stat["상세조회실패"] <= 3:
+                                    errors.append(f"{age}대 정당 일치도 분석 실패: {sanitize_error(error)}")
+                            if completed % 10 == 0 or completed == len(futures):
+                                progress_log(state, f"{age}대 정당 일치도 분석 진행: {completed}/{len(futures)} (성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
                 if term_stat["상세조회실패"] > 3:
                     errors.append(f"{age}대 정당 일치도 분석 실패 {term_stat['상세조회실패']}건 중 3건만 상세 표시했습니다. 대부분 열린국회정보 API 연결 타임아웃입니다.")
             except Exception as error:
@@ -2321,6 +2733,8 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
         max_vote_bills = int(state.get("max_vote_bills_to_scan", DEFAULT_MAX_VOTE_BILLS_TO_SCAN))
         force_refresh = bool(state.get("force_vote_refresh", False))
         workers = max(1, int(state.get("vote_fetch_workers") or DEFAULT_VOTE_FETCH_WORKERS))
+        async_enabled = bool(state.get("async_open_assembly_enabled", DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED))
+        async_concurrency = max(1, int(state.get("async_open_assembly_concurrency") or DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY))
         vote_terms = state.get("vote_terms", SUPPORTED_VOTE_TERMS)
         mona_codes = member_code_candidates(state)
         rows: List[Dict[str, Any]] = []
@@ -2331,7 +2745,8 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
             return {"vote_records": [], "yes_votes": [], "no_votes": [], "abstain_votes": [], "absent_votes": [], "vote_summary_by_term": [], "vote_fetch_stats": [], "errors": errors}
 
         scope_label = "전체" if max_vote_bills == 0 else f"최근 {max_vote_bills}건"
-        progress_log(state, f"표결정보 조회 시작: {format_terms(vote_terms)}, 대수별 {scope_label}, 병렬 {workers}개, 캐시 TTL {CACHE_TTL_HOURS}시간")
+        mode_label = f"비동기 {async_concurrency}개" if async_enabled else f"스레드 병렬 {workers}개"
+        progress_log(state, f"표결정보 조회 시작: {format_terms(vote_terms)}, 대수별 {scope_label}, {mode_label}, 캐시 TTL {CACHE_TTL_HOURS}시간")
         for age in vote_terms:
             term_stat = {"AGE": age, "표결의안": 0, "상세조회성공": 0, "상세조회실패": 0, "매칭표결": 0, "캐시사용": "N"}
             try:
@@ -2371,8 +2786,7 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
                         direct_rows = fetch_member_votes_direct_for_term(client, age, member_name, mona_codes, max_pages=max_pages, limit=max_vote_bills)
                     except Exception as error:
                         direct_rows = []
-                        errors.append(f"{age}대 의원명 기준 표결 일괄 조회 실패: {sanitize_error(error)}")
-                        progress_log(state, f"{age}대 의원명 기준 일괄 조회 실패: BILL_ID별 조회로 전환")
+                        progress_log(state, f"{age}대 의원명 기준 일괄 조회 실패: BILL_ID별 조회로 전환 ({sanitize_error(error)})")
                     if direct_rows:
                         cache_member_vote_rows_by_bill(age, member_name, direct_rows)
                         success_ids = [normalize_space(row.get("BILL_ID")) for row in direct_rows if normalize_space(row.get("BILL_ID"))]
@@ -2414,33 +2828,65 @@ def make_fetch_votes_node(client: AssemblyAPIClient):
                 term_stat["매칭표결"] = len(cached_rows)
                 term_stat["조회방식"] = "BILL_ID별조회"
                 progress_log(state, f"{age}대 표결 의안 후보 {len(vote_bills)}건 확보, 재조회 대상 {len(remaining_vote_bills)}건")
-                completed = 0
                 term_rows: List[Dict[str, Any]] = list(cached_rows)
                 success_bill_ids = set(cached_success_ids)
                 failed_bill_ids: List[str] = []
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {
-                        executor.submit(fetch_member_vote_for_bill, client, age, bill, member_name, mona_codes, force_refresh): normalize_space(bill.get("BILL_ID"))
-                        for bill in remaining_vote_bills
-                    }
-                    for future in as_completed(futures):
-                        completed += 1
-                        bill_id = futures[future]
-                        try:
-                            member_rows = future.result()
-                            term_rows.extend(member_rows)
-                            term_stat["상세조회성공"] += 1
-                            term_stat["매칭표결"] += len(member_rows)
-                            if bill_id:
-                                success_bill_ids.add(bill_id)
-                        except Exception as error:
-                            term_stat["상세조회실패"] += 1
-                            if bill_id:
-                                failed_bill_ids.append(bill_id)
-                            if term_stat["상세조회실패"] <= 3:
-                                errors.append(f"{age}대 표결 상세 조회 실패: {sanitize_error(error)}")
-                        if completed % 10 == 0 or completed == len(futures):
-                            progress_log(state, f"{age}대 표결 상세 조회 진행: {completed}/{len(futures)} (누적 성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
+                async_done = False
+                if async_enabled and remaining_vote_bills:
+                    try:
+                        member_rows, async_success_ids, async_failed_ids, failures = run_async_safely(
+                            async_collect_member_votes_for_bills(
+                                client.api_key,
+                                age,
+                                remaining_vote_bills,
+                                member_name,
+                                mona_codes,
+                                force_refresh,
+                                async_concurrency,
+                                lambda completed, total, success, failed: progress_log(
+                                    state,
+                                    f"{age}대 표결 상세 비동기 조회 진행: {completed}/{total} (배치 성공 {success}, 실패 {failed})",
+                                ),
+                            )
+                        )
+                        term_rows.extend(member_rows)
+                        success_bill_ids.update(async_success_ids)
+                        failed_bill_ids.extend(async_failed_ids)
+                        term_stat["상세조회성공"] += len(async_success_ids)
+                        term_stat["매칭표결"] += len(member_rows)
+                        term_stat["상세조회실패"] += len(failures)
+                        for error in failures[:3]:
+                            errors.append(f"{age}대 표결 상세 조회 실패: {sanitize_error(error)}")
+                        async_done = True
+                    except Exception as error:
+                        errors.append(f"{age}대 표결 상세 비동기 조회 실패, 동기 병렬로 재시도합니다: {sanitize_error(error)}")
+                        progress_log(state, f"{age}대 표결 상세 비동기 조회 실패: 동기 병렬 fallback")
+
+                if not async_done:
+                    completed = 0
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {
+                            executor.submit(fetch_member_vote_for_bill, client, age, bill, member_name, mona_codes, force_refresh): normalize_space(bill.get("BILL_ID"))
+                            for bill in remaining_vote_bills
+                        }
+                        for future in as_completed(futures):
+                            completed += 1
+                            bill_id = futures[future]
+                            try:
+                                member_rows = future.result()
+                                term_rows.extend(member_rows)
+                                term_stat["상세조회성공"] += 1
+                                term_stat["매칭표결"] += len(member_rows)
+                                if bill_id:
+                                    success_bill_ids.add(bill_id)
+                            except Exception as error:
+                                term_stat["상세조회실패"] += 1
+                                if bill_id:
+                                    failed_bill_ids.append(bill_id)
+                                if term_stat["상세조회실패"] <= 3:
+                                    errors.append(f"{age}대 표결 상세 조회 실패: {sanitize_error(error)}")
+                            if completed % 10 == 0 or completed == len(futures):
+                                progress_log(state, f"{age}대 표결 상세 조회 진행: {completed}/{len(futures)} (누적 성공 {term_stat['상세조회성공']}, 실패 {term_stat['상세조회실패']})")
                 if term_stat["상세조회실패"] > 3:
                     errors.append(f"{age}대 표결 상세 조회 실패 {term_stat['상세조회실패']}건 중 3건만 상세 표시했습니다. 대부분 열린국회정보 API 연결 타임아웃입니다.")
                 rows.extend(term_rows)
