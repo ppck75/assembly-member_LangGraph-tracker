@@ -194,6 +194,17 @@ def normalize_markdown(value: Any) -> str:
     return "\n".join(collapsed).strip()
 
 
+def remove_evidence_lines(value: Any) -> str:
+    lines = []
+    for line in normalize_markdown(value).splitlines():
+        stripped = line.strip()
+        marker_text = stripped.lstrip("-*0123456789. ").strip()
+        if marker_text.startswith("근거:") or marker_text.startswith("근거："):
+            continue
+        lines.append(line)
+    return normalize_markdown("\n".join(lines))
+
+
 def strip_html(value: Any) -> str:
     text = html.unescape(str(value or ""))
     text = re.sub(r"<[^>]+>", " ", text)
@@ -1041,16 +1052,16 @@ def fallback_legislative_interest_analysis(context: Dict[str, Any]) -> str:
         theme_text = " / ".join(
             f"{item.get('의제힌트')}({item.get('건수')}건)" for item in top_committees[:3]
         )
-        lines.append(f"- 소관위원회 기준으로는 {theme_text} 분야가 상대적으로 두드러집니다.")
-        lines.append("- 이는 해당 의원의 입법 관심이 위 분야의 제도 개선, 산업·행정 규율, 정책 조정 의제에 집중되어 있을 가능성을 보여줍니다.")
+        lines.append(f"- 소관위원회 기준으로는 {theme_text} 분야가 상대적으로 두드러집니다.\n  - 판단 기준: 법안의 소관위원회는 정책 분야를 대략적으로 분류하는 기준이므로, 위원회별 발의 건수를 관심 의제의 1차 신호로 봅니다.")
+        lines.append("- 이는 해당 의원의 입법 관심이 위 분야의 제도 개선, 산업·행정 규율, 정책 조정 의제에 집중되어 있을 가능성을 보여줍니다.\n  - 판단 기준: 법안명만 보지 않고 소관위원회 분포와 최근 법안 목록을 함께 확인합니다.")
     if recent_rep:
         bill_names = ", ".join(row.get("법안명", "") for row in recent_rep if row.get("법안명"))
         if bill_names:
-            lines.append(f"- 최근 대표발의 법안 근거: {bill_names}")
+            lines.append(f"- 최근 대표발의 법안에서 구체적인 관심 의제를 확인할 수 있습니다.\n  - 확인 자료: {bill_names}")
     if recent_co:
         bill_names = ", ".join(row.get("법안명", "") for row in recent_co if row.get("법안명"))
         if bill_names:
-            lines.append(f"- 최근 공동발의 법안 근거: {bill_names}")
+            lines.append(f"- 최근 공동발의 법안은 협업을 통한 의제 참여를 확인하는 보조 자료입니다.\n  - 확인 자료: {bill_names}")
     lines.append("- 이 분석은 법안명과 소관위원회 기준의 1차 해석입니다. 법안 원문, 제안이유, 회의록까지 결합하면 의제 성격을 더 정밀하게 분류할 수 있습니다.")
     return "\n".join(lines)
 
@@ -1058,7 +1069,7 @@ def fallback_legislative_interest_analysis(context: Dict[str, Any]) -> str:
 def generate_legislative_interest_analysis(context: Dict[str, Any]) -> tuple[str, str]:
     cache_key = [
         "google",
-        "readable_v2",
+        "judgment_basis_v4",
         DEFAULT_LLM_MODEL,
         context.get("member_name"),
         context.get("bill_total"),
@@ -1077,8 +1088,9 @@ def generate_legislative_interest_analysis(context: Dict[str, Any]) -> tuple[str
 
     system_prompt = (
         "당신은 국회의원 활동 데이터를 분석하는 정책 리서치 어시스턴트입니다. "
-        "정치적 호불호나 성과 평가를 하지 말고, 제공된 발의법안 통계와 법안 목록만 근거로 입법 관심 분야를 해석하세요. "
-        "추정은 반드시 '가능성', '신호', '해석상 주의'처럼 조심스럽게 표현하세요."
+        "정치적 호불호나 성과 평가를 하지 말고, 제공된 발의법안 통계와 법안 목록만 사용해 입법 관심 분야를 해석하세요. "
+        "추정은 반드시 '가능성', '신호', '해석상 주의'처럼 조심스럽게 표현하세요. "
+        "숫자를 반복하는 근거 문장은 피하고, 해석에 사용한 판단 기준과 확인 가능한 자료를 구분해 제시하세요."
     )
     user_prompt = f"""
 다음 JSON context를 바탕으로 의원의 입법 관심 분야를 분석하세요.
@@ -1087,7 +1099,9 @@ def generate_legislative_interest_analysis(context: Dict[str, Any]) -> tuple[str
 - 가독성이 좋도록 줄바꿈을 충분히 사용하세요.
 - 이모지는 섹션 구분용으로만 3~5개 정도 제한적으로 사용하세요.
 - 주요 관심 의제 3~5개를 `- 🔎 **의제명**` 형식으로 정리하세요.
-- 각 의제 아래에 `근거:`와 `해석:`을 짧게 나눠 쓰세요.
+- 각 의제 아래에는 `판단 기준:`과 `해석:`을 짧게 나눠 쓰세요.
+- `판단 기준:`에는 소관위원회 분포, 법안명, 대표/공동발의 역할 중 무엇을 보고 해석했는지 설명하세요.
+- 법안명을 제시할 때는 `확인 자료:`로 쓰고, 본문 숫자를 그대로 반복하는 문장은 피하세요.
 - 대표발의/공동발의 비중에 대한 간단한 해석을 별도 bullet로 쓰세요.
 - 처리결과가 미확인인 경우 성과 없음으로 단정하지 말라는 주의를 마지막에 쓰세요.
 - 제목(`#`, `##`)은 쓰지 말고 Markdown bullet만 사용하세요.
@@ -1352,16 +1366,16 @@ def fallback_cosponsor_network_analysis(context: Dict[str, Any]) -> str:
         return "- 공동발의자 문자열에서 반복 협업 네트워크를 구성할 충분한 데이터를 찾지 못했습니다."
 
     lines = [
-        f"- {member_name} 의원의 공동발의 네트워크는 파트너 {partner_count:,}명, 연결 {total_links:,}건으로 구성되며 현재 조회 범위에서는 **{network_type}**으로 볼 수 있습니다.",
-        f"- 정당 매칭 기준으로는 당내 협업 {same_party_rate:.1f}%, 당외 협업 {cross_party_rate:.1f}%로 **{bipartisanship_type}**에 가깝습니다.",
-        f"- 상위 3명 파트너가 전체 협업 연결의 {concentration:.1f}%를 차지하므로, 이 비중을 통해 협업이 소수에게 집중되는지 확인할 수 있습니다.",
+        f"- {member_name} 의원의 공동발의 네트워크는 파트너 {partner_count:,}명, 연결 {total_links:,}건으로 구성되며 현재 조회 범위에서는 **{network_type}**으로 볼 수 있습니다.\n  - 판단 기준: 파트너 수와 전체 협업 연결 수를 함께 보며, 상세 값은 아래 `공동발의 파트너` 표에서 확인할 수 있습니다.",
+        f"- 정당 매칭 기준으로는 당내 협업 {same_party_rate:.1f}%, 당외 협업 {cross_party_rate:.1f}%로 **{bipartisanship_type}**에 가깝습니다.\n  - 판단 기준: 정당 내/외 협업 비중은 공동발의자 정당 매칭 결과를 집계한 값이며, 발의 당시 정당과 다를 수 있습니다.",
+        f"- 상위 3명 파트너가 전체 협업 연결의 {concentration:.1f}%를 차지하므로, 이 비중을 통해 협업이 소수에게 집중되는지 확인할 수 있습니다.\n  - 판단 기준: 상위 반복 협업자의 비중이 높을수록 소수 파트너 집중형에 가깝게 해석합니다.",
     ]
     if top_partners:
         partner_text = ", ".join(f"{row.get('공동발의자')}({row.get('공동발의건수')}건)" for row in top_partners[:5])
-        lines.append(f"- 반복 협업 상위 파트너는 {partner_text}입니다.")
+        lines.append(f"- 반복 협업 상위 파트너는 {partner_text}입니다.\n  - 확인 위치: 아래 `공동발의 파트너` 표에서 파트너별 공동발의 건수와 정당 매칭을 볼 수 있습니다.")
     if committees:
         committee_text = ", ".join(f"{row.get('소관위원회')} {row.get('협업건수')}건" for row in committees[:3])
-        lines.append(f"- 협업은 소관위원회 기준 {committee_text}에서 상대적으로 많이 나타납니다.")
+        lines.append(f"- 협업은 소관위원회 기준 {committee_text}에서 상대적으로 많이 나타납니다.\n  - 확인 위치: 아래 `소관위원회별 네트워크 필터`와 관련 표에서 위원회별 협업 분포를 확인할 수 있습니다.")
     lines.append("- 공동발의는 정책 공조, 입장 표명, 의례적 참여가 섞일 수 있으므로 실제 정치적 연대나 정책 동의로 단정하지 않아야 합니다.")
     return "\n".join(lines)
 
@@ -1369,7 +1383,7 @@ def fallback_cosponsor_network_analysis(context: Dict[str, Any]) -> str:
 def generate_cosponsor_network_analysis(context: Dict[str, Any]) -> tuple[str, str]:
     cache_key = [
         "google",
-        "cosponsor_network_v1",
+        "cosponsor_network_interpretation_v3",
         DEFAULT_LLM_MODEL,
         context.get("member_name"),
         json.dumps(
@@ -1399,7 +1413,8 @@ def generate_cosponsor_network_analysis(context: Dict[str, Any]) -> tuple[str, s
 
     system_prompt = (
         "당신은 국회의원 공동발의 네트워크를 해석하는 입법 데이터 분석가입니다. "
-        "제공된 통계만 근거로 협업 패턴을 설명하고, 정치적 친소관계나 실제 정책 동의를 단정하지 마세요."
+        "제공된 통계만 사용해 협업 패턴을 설명하고, 정치적 친소관계나 실제 정책 동의를 단정하지 마세요. "
+        "숫자를 반복하는 근거 문장은 피하고, 해석 기준과 사용자가 원자료를 확인할 위치를 짧게 안내하세요."
     )
     user_prompt = f"""
 아래 JSON context를 바탕으로 공동발의 네트워크를 해석하세요.
@@ -1408,7 +1423,10 @@ def generate_cosponsor_network_analysis(context: Dict[str, Any]) -> tuple[str, s
 - 3~5개 Markdown bullet로 작성하세요.
 - 이 의원이 소수 반복 협업형, 분산 협업형, 분야 집중 협업형 중 어디에 가까운지 설명하세요.
 - 정당 내/정당 외 협업 비중을 바탕으로 초당적 협업 성격을 설명하세요.
-- 반복 협업 의원과 주요 소관위원회 분야를 근거로 언급하세요.
+- 반복 협업 의원과 주요 소관위원회 분야를 확인 자료로 언급하세요.
+- 같은 숫자를 반복하는 별도 확인 줄을 만들지 마세요.
+- 필요한 경우 `판단 기준:` 또는 `확인 위치:`를 1줄만 붙이고, 이미 본문에 쓴 숫자를 그대로 반복하지 마세요.
+- 확인 위치는 `공동발의 파트너 표`, `정당 내/외 협업 비중 차트`, `소관위원회별 네트워크 필터`처럼 화면에서 확인 가능한 영역으로 쓰세요.
 - 공동발의는 강한 정책 공조로 단정할 수 없다는 주의문을 포함하세요.
 - 정당 정보는 현재/최근 의원 정보 매칭 기준이므로 발의 당시 정당과 다를 수 있다는 한계를 언급하세요.
 - 제목은 쓰지 마세요.
@@ -2231,25 +2249,26 @@ def fallback_vote_interpretation_analysis(context: Dict[str, Any]) -> str:
     scope = normalize_space(context.get("analysis_scope")) or "선택 범위"
     summaries = context.get("party_alignment_summary", [])
     date_ranges = context.get("date_ranges", [])
-    lines = [f"- 이 해석은 {member_name} 의원의 표결 전체 경력이 아니라 현재 선택된 분석 범위인 대수별 {scope} 기준입니다."]
+    lines = [f"- 이 해석은 {member_name} 의원의 표결 전체 경력이 아니라 현재 선택된 분석 범위인 대수별 {scope} 기준입니다.\n  - 판단 기준: 분석 범위가 최근 N건이면 해당 기간의 일부 표결만 반영되므로 전체 재임 기간으로 일반화하지 않습니다."]
     for item in date_ranges:
         if item.get("start") and item.get("end"):
-            lines.append(f"- {item.get('AGE')}대 분석 표결은 {item.get('start')}~{item.get('end')} 기간에 해당하므로, 특정 시기에 표결이 몰려 있으면 전체 재임 기간의 성향으로 일반화하면 안 됩니다.")
+            lines.append(f"- {item.get('AGE')}대 분석 표결은 {item.get('start')}~{item.get('end')} 기간에 해당하므로, 특정 시기에 표결이 몰려 있으면 전체 재임 기간의 성향으로 일반화하면 안 됩니다.\n  - 판단 기준: 표결 날짜가 짧은 기간에 집중될수록 시기 효과가 커질 수 있습니다.")
     for item in summaries:
         total = int(item.get("분석표결", 0) or 0)
         absent = int(item.get("불참", 0) or 0)
         judged = int(item.get("일치", 0) or 0) + int(item.get("이탈", 0) or 0)
         if total and absent == total:
-            lines.append(f"- {item.get('AGE')}대는 분석 범위 {total}건이 모두 불참으로 분류되어 정당 다수 입장과의 일치·이탈 성향을 판단할 실제 찬성/반대/기권 표결이 없습니다.")
+            lines.append(f"- {item.get('AGE')}대는 분석 범위 {total}건이 모두 불참으로 분류되어 정당 다수 입장과의 일치·이탈 성향을 판단할 실제 찬성/반대/기권 표결이 없습니다.\n  - 판단 기준: 유효 표결이 없으면 일치율보다 불참 비중 자체를 먼저 해석해야 합니다.")
         elif total and judged == 0:
-            lines.append(f"- {item.get('AGE')}대는 일치율 계산에 사용할 유효 표결이 없어 일치율을 성향 지표로 해석하기 어렵습니다.")
-    lines.append("- 정당 다수 입장은 공식 당론이 아니라 해당 표결에서 같은 정당 의원 다수가 선택한 표결값 기준입니다.")
+            lines.append(f"- {item.get('AGE')}대는 일치율 계산에 사용할 유효 표결이 없어 일치율을 성향 지표로 해석하기 어렵습니다.\n  - 판단 기준: 일치·이탈 판정 가능한 표결이 부족하면 비율 지표가 안정적으로 해석되지 않습니다.")
+    lines.append("- 정당 다수 입장은 공식 당론이 아니라 해당 표결에서 같은 정당 의원 다수가 선택한 표결값 기준입니다.\n  - 판단 기준: 이 분석은 공식 당론 자료가 아니라 BILL_ID별 의원 표결 행의 다수값을 계산한 결과입니다.")
     return "\n".join(dict.fromkeys(lines))
 
 
 def generate_vote_interpretation_analysis(context: Dict[str, Any]) -> tuple[str, str]:
     cache_key = [
         "google",
+        "judgment_basis_v3",
         DEFAULT_LLM_MODEL,
         context.get("member_name"),
         context.get("party_alignment_vote_limit"),
@@ -2268,7 +2287,8 @@ def generate_vote_interpretation_analysis(context: Dict[str, Any]) -> tuple[str,
 
     system_prompt = (
         "당신은 국회의원 표결 통계를 해석할 때 사용자의 과잉 일반화를 막는 데이터 리서치 어시스턴트입니다. "
-        "제공된 JSON 통계만 근거로 해석 주의사항을 작성하고, 통계에 없는 정치적 의도나 사실을 추정하지 마세요."
+        "제공된 JSON 통계만 사용해 해석 주의사항을 작성하고, 통계에 없는 정치적 의도나 사실을 추정하지 마세요. "
+        "숫자를 반복하는 근거 문장은 피하고, 왜 그런 해석상 주의가 필요한지 판단 기준을 설명하세요."
     )
     user_prompt = f"""
 아래 JSON context를 바탕으로 표결 통계 해석 시 주의할 점을 작성하세요.
@@ -2279,6 +2299,8 @@ def generate_vote_interpretation_analysis(context: Dict[str, Any]) -> tuple[str,
 - 불참이 많거나 전부 불참이면 일치율/이탈률 해석 한계를 분명히 설명하세요.
 - '정당 다수 입장'은 공식 당론이 아니라 같은 정당 의원 다수 표결값 기준임을 언급하세요.
 - API 원자료 기준 불참과 추정 불참이 구분되어 있으면 그 차이를 반영하세요.
+- 각 bullet에는 필요한 경우 `판단 기준:`을 붙이되, 본문 숫자를 그대로 반복하지 마세요.
+- `판단 기준:`에는 분석 범위, 날짜 집중, 불참 비중, 유효 표결 부족, 정당 다수 입장 계산 방식 중 무엇 때문에 해석에 주의해야 하는지 쓰세요.
 - 3~5개 Markdown bullet로 간결하게 작성하세요.
 
 context:
@@ -2447,6 +2469,8 @@ def build_activity_briefing_context(state: MemberActivityState) -> Dict[str, Any
         "representative_total": len(state.get("representative_bills", [])),
         "cosponsored_total": len(state.get("cosponsored_bills", [])),
         "top_bill_committees": state.get("bill_committee_stats", [])[:5],
+        "recent_representative_bills": [compact_bill_record(row) for row in state.get("representative_bills", [])[:3]],
+        "recent_cosponsored_bills": [compact_bill_record(row) for row in state.get("cosponsored_bills", [])[:3]],
         "vote_total": len(state.get("vote_records", [])),
         "vote_summary_by_term": state.get("vote_summary_by_term", []),
         "party_alignment_rate": alignment_rate,
@@ -2456,6 +2480,7 @@ def build_activity_briefing_context(state: MemberActivityState) -> Dict[str, Any
             {
                 "title": normalize_space(item.get("title")),
                 "source": normalize_space(item.get("source")),
+                "url": normalize_space(item.get("url")),
             }
             for item in state.get("recent_news_items", [])[:5]
         ],
@@ -2491,7 +2516,7 @@ def fallback_activity_briefing(context: Dict[str, Any]) -> str:
 def generate_activity_briefing(context: Dict[str, Any]) -> tuple[str, str]:
     cache_key = [
         "google",
-        "activity_briefing_v1",
+        "activity_briefing_no_evidence_v3",
         DEFAULT_LLM_MODEL,
         context.get("member_name"),
         json.dumps(context, ensure_ascii=False, sort_keys=True),
@@ -2506,7 +2531,8 @@ def generate_activity_briefing(context: Dict[str, Any]) -> tuple[str, str]:
 
     system_prompt = (
         "당신은 국회의원 활동 데이터의 첫 화면 브리핑을 작성하는 데이터 리서치 어시스턴트입니다. "
-        "제공된 JSON 지표만 근거로 사용하고, 정치적 성과·의도·호불호를 단정하지 마세요."
+        "제공된 JSON 지표만 사용하고, 정치적 성과·의도·호불호를 단정하지 마세요. "
+        "핵심 브리핑은 첫 화면 요약이므로 별도의 근거 줄 없이 짧고 읽기 쉽게 작성하세요."
     )
     user_prompt = f"""
 아래 JSON context를 바탕으로 사용자가 차트와 표를 보기 전에 읽을 핵심 브리핑을 작성하세요.
@@ -2514,6 +2540,7 @@ def generate_activity_briefing(context: Dict[str, Any]) -> tuple[str, str]:
 규칙:
 - 3~5개 Markdown bullet로 작성하세요.
 - 각 bullet은 한 문장 중심으로 짧게 쓰세요.
+- 별도 확인 줄은 쓰지 마세요. 상세 자료는 각 탭의 표와 원자료에서 확인하게 합니다.
 - 발의법안 수, 대표/공동발의 비중, 소관위원회 분포, 표결 수, 정당 일치율, 최근 뉴스 수 중 데이터가 있는 항목을 골고루 반영하세요.
 - '두드러진다', '확인된다', '참고할 수 있다'처럼 조심스럽게 표현하세요.
 - 최근 뉴스는 웹 검색 기반 맥락이며 공식 의정활동 데이터와 구분된다고 언급하세요.
@@ -2525,7 +2552,7 @@ context:
 """.strip()
     llm = ChatGoogleGenerativeAI(model=DEFAULT_LLM_MODEL, temperature=0.15)
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-    briefing = normalize_markdown(getattr(response, "content", ""))
+    briefing = remove_evidence_lines(getattr(response, "content", ""))
     if not briefing:
         return fallback_activity_briefing(context), "rule_fallback"
     save_cache("activity_briefing", cache_key, briefing)
@@ -2991,7 +3018,7 @@ def fallback_recent_news_analysis(member_name: str, party_name: str, items: List
         source = item.get("source") or "출처 미확인"
         url = item.get("url") or ""
         citation = f"[{source}]({url})" if url else source
-        lines.append(f"- {title} - 근거: {citation}")
+        lines.append(f"- {title}\n  - 확인 자료: {citation}")
     lines.append("- 이 섹션은 열린국회정보 API가 아니라 최근 웹 검색 결과 기반입니다. 기사 제목과 요약만으로 의원의 의도, 실제 정책 성과, 논란의 사실관계를 단정할 수 없습니다.")
     return "\n".join(lines)
 
@@ -2999,7 +3026,7 @@ def fallback_recent_news_analysis(member_name: str, party_name: str, items: List
 def generate_recent_news_analysis(member_name: str, party_name: str, query: str, items: List[Dict[str, Any]]) -> tuple[str, str]:
     cache_key = [
         "google",
-        "separated_evidence_v3",
+        "source_links_v5",
         DEFAULT_LLM_MODEL,
         query,
         json.dumps([{k: item.get(k, "") for k in ["title", "source", "published", "url", "snippet"]} for item in items], ensure_ascii=False, sort_keys=True),
@@ -3012,16 +3039,16 @@ def generate_recent_news_analysis(member_name: str, party_name: str, query: str,
         return fallback_recent_news_analysis(member_name, party_name, items), "rule_fallback"
     system_prompt = (
         "당신은 국회의원 관련 최근 공개 이슈를 요약하는 리서치 어시스턴트입니다. "
-        "제공된 뉴스 검색 결과만 근거로 요약하고, 사실관계나 의도를 단정하지 마세요. "
-        "공식 의정활동 데이터가 아니라 웹 검색 기반 맥락이라는 점을 명확히 구분하세요."
+        "제공된 뉴스 검색 결과만 사용해 요약하고, 사실관계나 의도를 단정하지 마세요. "
+        "공식 의정활동 데이터가 아니라 웹 검색 기반 맥락이라는 점을 명확히 구분하세요. "
+        "기사 제목, 언론사, URL은 `확인 자료:`로 제시하세요."
     )
     user_prompt = f"""
 다음은 '{query}' 검색으로 수집한 최근 뉴스 최대 10건입니다.
 
 요구 출력:
 - 최근 의원 관련 이슈 3~5개를 Markdown bullet로 요약
-- 기사 URL이나 언론사 링크 목록은 출력하지 말 것
-- 각 bullet은 이슈명과 요약 문장만 포함할 것
+- 각 bullet 아래에는 `확인 자료:`를 붙이고, 관련 기사 제목, 언론사, URL을 1~2개 제시할 것
 - 기사 제목/요약 기반의 해석임을 밝히고, 사실관계 단정 금지
 - 열린국회정보 API 기반 공식 의정활동 데이터와 구분된 웹 검색 기반 맥락임을 마지막에 주의문으로 포함
 

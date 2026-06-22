@@ -13,6 +13,14 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+try:
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except Exception:
+    HumanMessage = None
+    SystemMessage = None
+    ChatGoogleGenerativeAI = None
+
 from src.member_activity_workflow import (
     DEFAULT_ASYNC_OPEN_ASSEMBLY_CONCURRENCY,
     DEFAULT_ASYNC_OPEN_ASSEMBLY_ENABLED,
@@ -66,6 +74,68 @@ ALIGNMENT_RESULT_KEYS = [
     "vote_interpretation_analysis",
     "vote_interpretation_analysis_source",
     "llm_quota_exhausted",
+]
+BILL_QA_EXAMPLE_QUESTIONS = [
+    "이 의원이 가장 많이 발의한 분야는 뭐야?",
+    "대표발의와 공동발의 비중을 설명해줘.",
+    "통과된 법안이 있어?",
+    "법사위 관련 법안만 요약해줘.",
+    "청년 관련 법안이 있어?",
+    "최근 발의한 법안 5개 알려줘.",
+]
+BILL_QA_STOPWORDS = {
+    "이",
+    "의원",
+    "의원이",
+    "가장",
+    "많이",
+    "발의",
+    "발의한",
+    "법안",
+    "관련",
+    "요약",
+    "설명",
+    "설명해줘",
+    "알려줘",
+    "뭐야",
+    "있어",
+    "있는지",
+    "최근",
+    "통과된",
+    "분야",
+}
+BILL_QA_COMMITTEE_ALIASES = {
+    "법사위": "법제사법위원회",
+    "과방위": "과학기술정보방송통신위원회",
+    "정무위": "정무위원회",
+    "행안위": "행정안전위원회",
+    "국토위": "국토교통위원회",
+    "교육위": "교육위원회",
+    "복지위": "보건복지위원회",
+    "기재위": "기획재정위원회",
+    "문체위": "문화체육관광위원회",
+    "국방위": "국방위원회",
+    "환노위": "환경노동위원회",
+}
+BILL_QA_OUT_OF_SCOPE_TERMS = ["표결", "투표", "찬성", "반대", "기권", "불참", "정당", "뉴스", "최근 이슈", "여론", "지지율"]
+BILL_QA_STAT_QUESTION_TERMS = [
+    "분야",
+    "소관",
+    "위원회",
+    "비중",
+    "통계",
+    "처리결과",
+    "대표발의",
+    "공동발의",
+    "대표",
+    "공동",
+    "통과",
+    "가결",
+    "계류",
+    "폐기",
+    "전체",
+    "총",
+    "몇",
 ]
 
 
@@ -699,6 +769,287 @@ def clean_recent_news_analysis_text(value: Any) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def compact_bill_for_qa(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "역할": normalize_text(row.get("_ROLE")),
+        "대수": normalize_text(row.get("AGE") or row.get("_REQUEST_AGE")),
+        "의안번호": normalize_text(row.get("BILL_NO")),
+        "법안명": normalize_text(row.get("BILL_NAME")),
+        "발의일": normalize_text(row.get("PROPOSE_DT") or row.get("PPSL_DT")),
+        "소관위원회": normalize_text(row.get("COMMITTEE")),
+        "처리결과": normalize_text(row.get("PROC_RESULT")) or "미확인",
+        "링크": normalize_text(row.get("DETAIL_LINK") or row.get("LINK_URL")),
+    }
+
+
+def compact_bill_for_recent_qa(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "역할": normalize_text(row.get("_ROLE")),
+        "대수": normalize_text(row.get("AGE") or row.get("_REQUEST_AGE")),
+        "의안번호": normalize_text(row.get("BILL_NO")),
+        "법안명": normalize_text(row.get("BILL_NAME")),
+        "발의일": normalize_text(row.get("PROPOSE_DT") or row.get("PPSL_DT")),
+        "소관위원회": normalize_text(row.get("COMMITTEE")),
+        "링크": normalize_text(row.get("DETAIL_LINK") or row.get("LINK_URL")),
+    }
+
+
+def bill_qa_search_terms(question: str) -> List[str]:
+    normalized = normalize_text(question)
+    terms: List[str] = []
+    for source, target in BILL_QA_COMMITTEE_ALIASES.items():
+        if source in normalized:
+            terms.extend([source, target])
+    for token in re.findall(r"[가-힣A-Za-z0-9]{2,}", normalized):
+        if token in BILL_QA_STOPWORDS:
+            continue
+        terms.append(token)
+    result: List[str] = []
+    for term in terms:
+        if term and term not in result:
+            result.append(term)
+    return result
+
+
+def is_bill_qa_stat_question(question: str) -> bool:
+    question_text = normalize_text(question)
+    return any(term in question_text for term in BILL_QA_STAT_QUESTION_TERMS)
+
+
+def is_recent_bill_list_question(question: str) -> bool:
+    question_text = normalize_text(question)
+    return "최근" in question_text and any(term in question_text for term in ["법안", "발의", "의안"])
+
+
+def requested_bill_count(question: str, default: int = 5, maximum: int = 20) -> int:
+    numbers = [int(number) for number in re.findall(r"\d+", normalize_text(question))]
+    if not numbers:
+        return default
+    return max(1, min(max(numbers), maximum))
+
+
+def top_stat_rows(rows: List[Dict[str, Any]], label_key: str, count_key: str = "건수", limit: int = 5) -> List[Dict[str, Any]]:
+    normalized_rows = [
+        {label_key: normalize_text(row.get(label_key)), count_key: as_int(row.get(count_key))}
+        for row in rows
+        if normalize_text(row.get(label_key))
+    ]
+    return sorted(normalized_rows, key=lambda row: row.get(count_key, 0), reverse=True)[:limit]
+
+
+def row_matches_bill_question(row: Dict[str, Any], terms: List[str]) -> bool:
+    if not terms:
+        return False
+    text = " ".join(
+        normalize_text(row.get(key))
+        for key in ["BILL_NAME", "COMMITTEE", "PROC_RESULT", "_ROLE", "BILL_NO", "PROPOSE_DT", "PPSL_DT"]
+    )
+    return any(term in text for term in terms)
+
+
+def select_bill_qa_evidence(result: Dict[str, Any], question: str, limit: int = 30) -> List[Dict[str, Any]]:
+    bills = list(result.get("sponsored_bills", []) or [])
+    if not bills:
+        return []
+
+    terms = bill_qa_search_terms(question)
+    question_text = normalize_text(question)
+    matched = [row for row in bills if row_matches_bill_question(row, terms)]
+
+    if any(word in question_text for word in ["분야", "소관", "위원회", "많이 발의"]):
+        top_committees = top_stat_rows(result.get("bill_committee_stats", []) or [], "소관위원회", limit=3)
+        committee_names = {row.get("소관위원회") for row in top_committees}
+        if committee_names:
+            matched = [row for row in bills if normalize_text(row.get("COMMITTEE")) in committee_names]
+
+    if "대표" in question_text and "공동" in question_text:
+        representative_rows = [row for row in bills if normalize_text(row.get("_ROLE")) == "대표발의"]
+        cosponsored_rows = [row for row in bills if normalize_text(row.get("_ROLE")) == "공동발의"]
+        half = max(1, limit // 2)
+        matched = representative_rows[:half] + cosponsored_rows[:half]
+    elif "대표" in question_text and "공동" not in question_text:
+        role_rows = [row for row in bills if normalize_text(row.get("_ROLE")) == "대표발의"]
+        matched = role_rows[:limit] if not matched else [row for row in matched if normalize_text(row.get("_ROLE")) == "대표발의"] or matched
+    elif "공동" in question_text and "대표" not in question_text:
+        role_rows = [row for row in bills if normalize_text(row.get("_ROLE")) == "공동발의"]
+        matched = role_rows[:limit] if not matched else [row for row in matched if normalize_text(row.get("_ROLE")) == "공동발의"] or matched
+
+    if any(word in question_text for word in ["통과", "가결", "의결"]):
+        passed = [row for row in bills if any(word in normalize_text(row.get("PROC_RESULT")) for word in ["가결", "의결", "공포"])]
+        matched = passed if passed else matched
+
+    if "최근" in question_text and not matched:
+        matched = bills[:limit]
+
+    if not matched and terms:
+        return []
+    if not matched:
+        matched = bills[:limit]
+    return [compact_bill_for_qa(row) for row in matched[:limit]]
+
+
+def build_bill_qa_context(result: Dict[str, Any], question: str) -> Dict[str, Any]:
+    bills = list(result.get("sponsored_bills", []) or [])
+    evidence_bills = select_bill_qa_evidence(result, question)
+    recent_list_question = is_recent_bill_list_question(question)
+    recent_limit = requested_bill_count(question, default=5)
+    return {
+        "member_name": result.get("member_name", ""),
+        "question": question,
+        "scope": "현재 조회된 발의법안 데이터",
+        "answer_mode": "recent_bill_list" if recent_list_question else "general",
+        "recent_list_limit": recent_limit,
+        "summary": {
+            "total_bills": len(bills),
+            "representative_bills": len(result.get("representative_bills", []) or []),
+            "cosponsored_bills": len(result.get("cosponsored_bills", []) or []),
+            "by_result": result.get("bill_result_stats", []),
+            "by_committee": result.get("bill_committee_stats", []),
+        },
+        "matched_bills": [compact_bill_for_recent_qa(row) for row in bills[:recent_limit]] if recent_list_question else evidence_bills,
+        "recent_bills": [compact_bill_for_recent_qa(row) for row in bills[:10]],
+    }
+
+
+def fallback_bill_qa_answer(context: Dict[str, Any]) -> str:
+    summary = context.get("summary", {})
+    matched = context.get("matched_bills", [])
+    question = normalize_text(context.get("question"))
+    if not summary.get("total_bills"):
+        return "현재 조회된 발의법안 데이터가 없어 답변할 수 없습니다."
+
+    if context.get("answer_mode") == "recent_bill_list":
+        limit = int(context.get("recent_list_limit") or 5)
+        recent_rows = matched[:limit]
+        if not recent_rows:
+            return "현재 조회된 발의법안 데이터에서 최근 발의 법안을 확인하지 못했습니다."
+        lines = [f"최근 발의한 법안 {len(recent_rows):,}건은 다음과 같습니다."]
+        for index, row in enumerate(recent_rows, start=1):
+            committee = row.get("소관위원회") or "소관위원회 미확인"
+            role = row.get("역할") or "역할 미확인"
+            date = row.get("발의일") or "발의일 미확인"
+            lines.append(f"{index}. 「{row.get('법안명')}」 - {date}, {role}, {committee}")
+        lines.append("확인 자료: 현재 조회된 발의법안 목록을 발의일 기준 최근순으로 정렬한 결과입니다.")
+        return "\n\n".join(lines)
+
+    if any(word in question for word in ["분야", "소관", "위원회", "많이 발의"]):
+        top_committees = top_stat_rows(summary.get("by_committee", []) or [], "소관위원회", limit=5)
+        if top_committees:
+            top = top_committees[0]
+            ranking = " / ".join(
+                f"{row.get('소관위원회')} {as_int(row.get('건수')):,}건"
+                for row in top_committees
+            )
+            evidence_text = "; ".join(
+                f"「{row.get('법안명')}」({row.get('역할')}, {row.get('소관위원회')}, {row.get('발의일')}, {row.get('처리결과')})"
+                for row in matched[:5]
+                if row.get("법안명")
+            )
+            lines = [
+                f"현재 조회된 발의법안 기준으로 가장 많이 나타난 분야는 `{top.get('소관위원회')}`입니다.",
+                f"상위 소관위원회는 {ranking} 순입니다.",
+                "소관위원회는 법안의 정책 분야를 대략적으로 보여주는 기준으로 볼 수 있습니다.",
+                "판단 기준: 법안의 소관위원회는 정책 분야를 대략적으로 분류하는 기준이므로, 소관위원회별 발의 건수를 분야 판단의 1차 기준으로 봅니다.",
+            ]
+            if evidence_text:
+                lines.append(f"확인 자료: {evidence_text}")
+            return "\n\n".join(lines)
+
+    if not matched and bill_qa_search_terms(question) and not is_bill_qa_stat_question(question):
+        return "현재 조회된 발의법안 데이터에서는 질문과 직접 관련된 법안을 확인하지 못했습니다.\n\n판단 기준: 질문 키워드가 현재 조회된 법안명·소관위원회·처리결과와 연결되는지 확인했습니다."
+
+    lines = [
+        f"현재 조회된 발의법안은 총 {as_int(summary.get('total_bills')):,}건이며, 대표발의 {as_int(summary.get('representative_bills')):,}건 / 공동발의 {as_int(summary.get('cosponsored_bills')):,}건입니다.",
+        "판단 기준: 발의법안의 역할 구분은 대표발의와 공동발의 건수를 나누어 봅니다.",
+    ]
+    if matched:
+        evidence_text = "; ".join(
+            f"「{row.get('법안명')}」({row.get('역할')}, {row.get('소관위원회')}, {row.get('발의일')}, {row.get('처리결과')})"
+            for row in matched[:5]
+            if row.get("법안명")
+        )
+        if evidence_text:
+            lines.append(f"질문과 관련해 우선 확인할 수 있는 법안은 {len(matched):,}건입니다.")
+            lines.append(f"확인 자료: {evidence_text}")
+    return "\n\n".join(lines)
+
+
+def gemini_key_validation_error(key: str) -> str:
+    key = str(key or "").strip()
+    if not key:
+        return "missing"
+    try:
+        key.encode("ascii")
+    except UnicodeEncodeError:
+        return "non_ascii"
+    if any(ch.isspace() or ord(ch) < 33 or ord(ch) > 126 for ch in key):
+        return "invalid_character"
+    return ""
+
+
+def current_gemini_key_validation_error() -> str:
+    return gemini_key_validation_error(str(st.session_state.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""))
+
+
+def generate_bill_qa_answer(result: Dict[str, Any], question: str) -> Dict[str, Any]:
+    context = build_bill_qa_context(result, question)
+    evidence = context.get("matched_bills", [])
+    question_text = normalize_text(question)
+    if any(term in question_text for term in BILL_QA_OUT_OF_SCOPE_TERMS) and not any(term in question_text for term in ["발의", "법안", "의안"]):
+        return {
+            "answer": "이 챗봇은 현재 조회된 발의법안 데이터만 기준으로 답변합니다. 표결, 정당 일치도, 뉴스 관련 질문은 각각의 탭과 원자료를 확인해 주세요.\n\n판단 기준: 발의법안 Q&A 탭의 답변 범위는 발의법안 목록, 처리결과 통계, 소관위원회 통계로 제한됩니다.",
+            "evidence": [],
+            "source": "out_of_scope",
+        }
+    if not context.get("summary", {}).get("total_bills"):
+        return {"answer": fallback_bill_qa_answer(context), "evidence": evidence, "source": "empty"}
+    if context.get("answer_mode") == "recent_bill_list":
+        return {"answer": fallback_bill_qa_answer(context), "evidence": evidence, "source": "rule_recent_list"}
+    if not evidence and bill_qa_search_terms(question) and not is_bill_qa_stat_question(question):
+        return {"answer": fallback_bill_qa_answer(context), "evidence": evidence, "source": "no_match"}
+    key_error = gemini_key_validation_error(os.environ.get("GOOGLE_API_KEY", ""))
+    if key_error:
+        return {
+            "answer": "발의법안 Q&A 챗봇을 사용하려면 올바른 Gemini API 키가 필요합니다. 키에 한글, 공백, 줄바꿈이 섞이지 않았는지 확인해 주세요.",
+            "evidence": evidence,
+            "source": "invalid_api_key",
+        }
+    if ChatGoogleGenerativeAI is None or SystemMessage is None or HumanMessage is None or not os.environ.get("GOOGLE_API_KEY"):
+        return {"answer": fallback_bill_qa_answer(context), "evidence": evidence, "source": "rule_fallback"}
+
+    system_prompt = (
+        "당신은 현재 조회된 국회의원 발의법안 데이터만 설명하는 Q&A 어시스턴트입니다. "
+        "제공된 발의법안 목록, 처리결과 통계, 소관위원회 통계만 사용해 답하세요. "
+        "표결, 뉴스, 정당 일치도, 의원의 정치적 의도나 성과 평가는 답하지 마세요. "
+        "데이터에 없으면 '현재 조회된 발의법안 데이터에서는 확인되지 않습니다'라고 답하세요. "
+        "해석에는 `판단 기준:`을, 법안 예시에는 `확인 자료:`를 사용하세요. 숫자를 그대로 반복하는 근거 문장은 피하세요. "
+        "최근 발의 법안 목록을 묻는 질문에서는 처리결과를 말하지 말고, 법안명·발의일·대표/공동발의 역할·소관위원회만 제시하세요."
+    )
+    user_prompt = f"""
+아래 JSON context와 사용자의 질문을 바탕으로 답변하세요.
+
+규칙:
+- 3~6문장 이내로 간결하게 답하세요.
+- 질문이 발의법안 범위를 벗어나면 이 챗봇은 현재 조회된 발의법안 데이터만 답한다고 안내하세요.
+- 필요한 경우 `판단 기준:` 또는 `확인 자료:`를 포함하세요.
+- `판단 기준:`에는 어떤 통계나 분류 기준으로 답했는지 쓰고, `확인 자료:`에는 법안명, 역할, 소관위원회, 발의일을 사람이 읽을 수 있게 쓰세요.
+- context.answer_mode가 `recent_bill_list`이면 처리결과를 언급하지 마세요. 특히 "처리 결과는 미확인입니다"를 반복하지 마세요.
+- 본문 숫자를 그대로 반복하는 확인 문장은 쓰지 마세요.
+- matched_bills가 비어 있으면 관련 법안을 확인하지 못했다고 답하세요.
+
+context:
+{json.dumps(context, ensure_ascii=False, indent=2)}
+""".strip()
+    llm = ChatGoogleGenerativeAI(model=DEFAULT_LLM_MODEL, temperature=0.1)
+    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+    answer = str(getattr(response, "content", "") or "").strip()
+    return {"answer": answer or fallback_bill_qa_answer(context), "evidence": evidence, "source": "llm" if answer else "rule_fallback"}
 
 
 def render_echarts(title: str, option: Dict[str, Any], *, height: int = 360) -> None:
@@ -1569,6 +1920,143 @@ def render_bills_tab(result: Dict[str, Any]) -> None:
         render_dataframe("발의 법안 전체", bills, bill_cols, height=520)
 
 
+def set_bill_qa_example_question(question: str) -> None:
+    st.session_state["bill_qa_question_input"] = question
+
+
+def bill_qa_result_signature(result: Dict[str, Any]) -> str:
+    bills = list(result.get("sponsored_bills", []) or [])
+    parts = [
+        str(result.get("member_name", "")),
+        str(len(bills)),
+        "|".join(str(row.get("BILL_NO") or row.get("BILL_ID") or "") for row in bills[:5]),
+    ]
+    return "::".join(parts)
+
+
+def reset_bill_qa_if_needed(result: Dict[str, Any]) -> None:
+    signature = bill_qa_result_signature(result)
+    if st.session_state.get("bill_qa_signature") == signature:
+        return
+    st.session_state["bill_qa_signature"] = signature
+    st.session_state["bill_qa_messages"] = []
+    st.session_state["bill_qa_question_input"] = ""
+    st.session_state.pop("bill_qa_pending_question", None)
+    st.session_state.pop("bill_qa_clear_input", None)
+
+
+def render_bill_qa_message(message: Dict[str, Any], index: int) -> None:
+    role = message.get("role", "assistant")
+    with st.chat_message(role):
+        st.markdown(str(message.get("content", "")))
+        evidence = list(message.get("evidence", []) or [])
+        if role == "assistant" and evidence:
+            with st.expander("사용한 근거 법안", expanded=False):
+                df = as_dataframe(evidence, ["역할", "대수", "의안번호", "법안명", "발의일", "소관위원회", "처리결과", "링크"])
+                st.dataframe(df, use_container_width=True, height=min(360, 80 + len(df) * 36))
+                csv = df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "근거 법안 CSV 다운로드",
+                    data=csv,
+                    file_name=f"bill_qa_evidence_{index}.csv",
+                    mime="text/csv",
+                    key=f"bill_qa_evidence_download_{index}",
+                )
+
+
+def render_bill_qa_tab(result: Dict[str, Any]) -> None:
+    reset_bill_qa_if_needed(result)
+    bills = list(result.get("sponsored_bills", []) or [])
+
+    st.subheader("발의법안 Q&A 챗봇")
+    st.caption("현재 조회된 발의법안 데이터만 기준으로 답변합니다. 표결, 뉴스, 정당 일치도 질문은 해당 탭의 원자료를 확인해 주세요.")
+    if not bills:
+        st.info("현재 조회된 발의법안 데이터가 없어 Q&A를 실행할 수 없습니다.")
+        return
+
+    with st.expander("사용 방식과 답변 범위", expanded=False):
+        st.markdown(
+            """
+- 이 챗봇은 현재 분석 결과에 포함된 발의법안 목록, 처리결과 통계, 소관위원회 통계만 사용합니다.
+- 답변에는 필요에 따라 `판단 기준:` 또는 `확인 자료:`를 붙여 해석 기준과 법안 예시를 구분해 제시합니다.
+- 현재 조회 데이터에서 확인되지 않는 내용은 확인되지 않는다고 답변합니다.
+"""
+        )
+
+    key_error = current_gemini_key_validation_error()
+    if key_error == "missing":
+        st.warning(
+            "발의법안 Q&A 챗봇을 사용하려면 페이지 상단의 `Gemini API 키` 입력란에 본인의 키를 입력해야 합니다. "
+            "키 입력 후 다시 이 탭에서 예상 질문을 클릭하거나 직접 질문할 수 있습니다."
+        )
+        st.caption("키 발급: https://aistudio.google.com/apikey")
+        return
+    if key_error:
+        st.error("Gemini API 키 형식이 올바르지 않습니다. 키에 한글, 공백, 줄바꿈이 섞이지 않았는지 확인해 주세요.")
+        st.caption("키 발급: https://aistudio.google.com/apikey")
+        return
+
+    st.markdown("#### 예상 질문")
+    question_columns = st.columns(2)
+    for index, question in enumerate(BILL_QA_EXAMPLE_QUESTIONS):
+        with question_columns[index % 2]:
+            st.button(
+                question,
+                key=f"bill_qa_example_{index}",
+                use_container_width=True,
+                on_click=set_bill_qa_example_question,
+                args=(question,),
+            )
+
+    st.divider()
+    if st.button("대화 기록 지우기", key="clear_bill_qa_chat"):
+        st.session_state["bill_qa_messages"] = []
+        st.session_state["bill_qa_question_input"] = ""
+        st.session_state.pop("bill_qa_clear_input", None)
+        st.rerun()
+
+    messages = list(st.session_state.get("bill_qa_messages", []) or [])
+    if not messages:
+        st.info("예상 질문을 클릭하거나 직접 질문을 입력해 보세요.")
+    for index, message in enumerate(messages):
+        render_bill_qa_message(message, index)
+
+    st.divider()
+    if st.session_state.pop("bill_qa_clear_input", False):
+        st.session_state["bill_qa_question_input"] = ""
+
+    question_value = st.text_input(
+        "발의법안 데이터에 대해 질문하세요",
+        key="bill_qa_question_input",
+        placeholder="예: 청년 관련 법안이 있어?",
+    )
+    ask_clicked = st.button("질문하기", type="primary", key="submit_bill_qa_question")
+
+    question_to_submit = normalize_text(question_value) if ask_clicked else ""
+
+    if question_to_submit:
+        st.session_state.setdefault("bill_qa_messages", []).append({"role": "user", "content": question_to_submit})
+        with st.spinner("현재 조회된 발의법안 데이터를 기준으로 답변을 생성하고 있습니다."):
+            try:
+                answer_payload = generate_bill_qa_answer(result, question_to_submit)
+            except Exception as error:
+                answer_payload = {
+                    "answer": f"답변 생성 중 오류가 발생했습니다: {error}",
+                    "evidence": [],
+                    "source": "error",
+                }
+        st.session_state["bill_qa_messages"].append(
+            {
+                "role": "assistant",
+                "content": answer_payload.get("answer", ""),
+                "evidence": answer_payload.get("evidence", []),
+                "source": answer_payload.get("source", ""),
+            }
+        )
+        st.session_state["bill_qa_clear_input"] = True
+        st.rerun()
+
+
 def render_votes_tab(result: Dict[str, Any]) -> None:
     summary = result.get("vote_summary_by_term", [])
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1725,19 +2213,21 @@ def render_additional_vote_lookup(result: Dict[str, Any]) -> None:
 
 
 def render_result(result: Dict[str, Any]) -> None:
-    tabs = st.tabs(["요약", "발의 법안", "표결", "정당 일치도", "최근 이슈", "원자료"])
+    tabs = st.tabs(["요약", "발의 법안", "발의법안 Q&A 챗봇", "표결", "정당 일치도", "최근 이슈", "원자료"])
     with tabs[0]:
         render_summary_tab(result)
     with tabs[1]:
         render_bills_tab(result)
     with tabs[2]:
+        render_bill_qa_tab(result)
+    with tabs[3]:
         render_votes_tab(result)
         render_additional_vote_lookup(result)
-    with tabs[3]:
-        render_alignment_tab(result)
     with tabs[4]:
-        render_news_tab(result)
+        render_alignment_tab(result)
     with tabs[5]:
+        render_news_tab(result)
+    with tabs[6]:
         render_raw_tab(result)
 
 
@@ -1754,6 +2244,8 @@ gemini_api_key = st.text_input(
     value=st.session_state.get("GEMINI_API_KEY", ""),
     placeholder="발급 받은 key를 입력하세요",
 )
+if gemini_api_key.strip():
+    configure_user_gemini_key(gemini_api_key)
 st.caption("키 발급: https://aistudio.google.com/apikey")
 st.caption(f"사용 모델: `{DEFAULT_LLM_MODEL}`")
 if gemini_api_key:
