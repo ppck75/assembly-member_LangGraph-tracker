@@ -63,6 +63,8 @@ APP_PARTY_ALIGNMENT_SLIDER_MAX = 500
 MEMBER_DIRECTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 MEMBER_DIRECTORY_PAGE_SIZE = 9
 APP_DEFAULT_BILL_TERM_SCOPE = "recent"
+RESULT_TAB_STATE_KEY = "active_result_tab"
+RESULT_TAB_LABELS = ["요약", "발의 법안", "발의법안 Q&A 챗봇", "표결", "정당 일치도", "최근 이슈", "원자료"]
 ALIGNMENT_RESULT_KEYS = [
     "party_alignment_vote_limit",
     "party_alignment_summary",
@@ -2212,22 +2214,49 @@ def render_additional_vote_lookup(result: Dict[str, Any]) -> None:
         render_vote_fetch_status_text("추가 표결 조회 상태", update.get("vote_fetch_stats", []))
 
 
+def ensure_active_result_tab() -> None:
+    if st.session_state.get(RESULT_TAB_STATE_KEY) not in RESULT_TAB_LABELS:
+        st.session_state[RESULT_TAB_STATE_KEY] = RESULT_TAB_LABELS[0]
+
+
+def render_result_tab_selector() -> str:
+    ensure_active_result_tab()
+    if hasattr(st, "segmented_control"):
+        selected = st.segmented_control(
+            "결과 화면",
+            RESULT_TAB_LABELS,
+            key=RESULT_TAB_STATE_KEY,
+            label_visibility="collapsed",
+        )
+        if selected not in RESULT_TAB_LABELS:
+            selected = st.session_state.get(RESULT_TAB_STATE_KEY, RESULT_TAB_LABELS[0])
+        return str(selected)
+    return st.radio(
+        "결과 화면",
+        RESULT_TAB_LABELS,
+        key=RESULT_TAB_STATE_KEY,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+
 def render_result(result: Dict[str, Any]) -> None:
-    tabs = st.tabs(["요약", "발의 법안", "발의법안 Q&A 챗봇", "표결", "정당 일치도", "최근 이슈", "원자료"])
-    with tabs[0]:
+    selected_tab = render_result_tab_selector()
+    st.divider()
+    if selected_tab == "요약":
         render_summary_tab(result)
-    with tabs[1]:
+    elif selected_tab == "발의 법안":
         render_bills_tab(result)
-    with tabs[2]:
+    elif selected_tab == "발의법안 Q&A 챗봇":
         render_bill_qa_tab(result)
-    with tabs[3]:
+    elif selected_tab == "표결":
         render_votes_tab(result)
         render_additional_vote_lookup(result)
-    with tabs[4]:
+    elif selected_tab == "정당 일치도":
         render_alignment_tab(result)
-    with tabs[5]:
+    elif selected_tab == "최근 이슈":
         render_news_tab(result)
-    with tabs[6]:
+    elif selected_tab == "원자료":
         render_raw_tab(result)
 
 
@@ -2406,11 +2435,13 @@ if run_button:
             if gemini_api_key.strip():
                 configure_user_gemini_key(gemini_api_key)
             st.session_state["member_activity_result"] = run_analysis(member_name, options)
+            st.session_state[RESULT_TAB_STATE_KEY] = "요약"
         except Exception as error:
             st.error(f"분석 중 오류가 발생했습니다: {error}")
 
 if st.session_state.get("member_activity_result") and st.session_state["member_activity_result"].get("_workflow_version") != WORKFLOW_VERSION:
     st.session_state.pop("member_activity_result", None)
+    st.session_state[RESULT_TAB_STATE_KEY] = "요약"
 
 render_member_directory_section()
 
