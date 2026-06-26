@@ -773,6 +773,157 @@ def clean_recent_news_analysis_text(value: Any) -> str:
     return "\n".join(lines).strip()
 
 
+REFERENCE_LABELS = {
+    "판단기준": "판단 기준",
+    "판단 기준": "판단 기준",
+    "확인자료": "확인 자료",
+    "확인 자료": "확인 자료",
+    "확인위치": "확인 위치",
+    "확인 위치": "확인 위치",
+    "근거": "확인 자료",
+}
+
+
+def parse_reference_line(line: str) -> tuple[str, str] | None:
+    match = re.match(
+        r"^\s*(?:[-*]\s*)?(판단\s*기준|판단기준|확인\s*자료|확인자료|확인\s*위치|확인위치|근거)\s*[:：]\s*(.*)$",
+        line.strip(),
+    )
+    if not match:
+        return None
+    label = re.sub(r"\s+", " ", match.group(1)).strip()
+    return REFERENCE_LABELS.get(label.replace(" ", ""), label), match.group(2).strip()
+
+
+def parse_interpretation_line(line: str) -> str | None:
+    match = re.match(r"^\s*(?:[-*]\s*)?해석\s*[:：]\s*(.*)$", line.strip())
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def is_likely_analysis_heading(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped.startswith("#") or stripped.startswith(("🔎", "📌", "✅", "⚠️", "🧭")) or re.match(r"^[-*]\s*🔎", stripped))
+
+
+def move_legislative_interpretation_before_references(text: str) -> str:
+    output: List[str] = []
+    pending_references: List[str] = []
+    skipped_blank_after_reference = False
+
+    for line in str(text or "").splitlines():
+        if parse_reference_line(line):
+            pending_references.append(line)
+            skipped_blank_after_reference = False
+            continue
+
+        interpretation = parse_interpretation_line(line)
+        if interpretation is not None:
+            output.append(f"- {interpretation}" if interpretation else "- 해석 내용이 제공되지 않았습니다.")
+            output.extend(pending_references)
+            pending_references = []
+            skipped_blank_after_reference = False
+            continue
+
+        if pending_references and not line.strip():
+            skipped_blank_after_reference = True
+            continue
+
+        if pending_references and is_likely_analysis_heading(line):
+            output.extend(pending_references)
+            pending_references = []
+            if skipped_blank_after_reference:
+                output.append("")
+            skipped_blank_after_reference = False
+
+        if pending_references:
+            output.extend(pending_references)
+            pending_references = []
+            if skipped_blank_after_reference:
+                output.append("")
+            skipped_blank_after_reference = False
+
+        output.append(line)
+
+    output.extend(pending_references)
+    return "\n".join(output).strip()
+
+
+def markdown_inline_to_html(text: str) -> str:
+    escaped = html.escape(str(text or ""))
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        lambda match: f'<a href="{html.escape(match.group(2), quote=True)}" target="_blank" rel="noopener noreferrer">{match.group(1)}</a>',
+        escaped,
+    )
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def format_llm_reference_markdown(text: Any, *, interpretation_first: bool = False) -> str:
+    source = str(text or "").strip()
+    if interpretation_first:
+        source = move_legislative_interpretation_before_references(source)
+
+    formatted_lines: List[str] = [
+        """
+<style>
+.llm-reference-line {
+    margin: 0.18rem 0 0.7rem 1.35rem;
+    padding-left: 0.8rem;
+    border-left: 2px solid #d7dee8;
+    color: #6b7280;
+    font-size: 0.92rem;
+    line-height: 1.65;
+}
+.llm-reference-label {
+    color: #4b5563;
+    font-weight: 650;
+}
+.llm-reference-line a {
+    color: #4b77be;
+}
+</style>
+        """.strip()
+    ]
+    pending_empty_reference = False
+
+    for line in source.splitlines():
+        reference = parse_reference_line(line)
+        if reference:
+            label, content = reference
+            if content:
+                formatted_lines.append(
+                    f'<div class="llm-reference-line"><span class="llm-reference-label">{html.escape(label)}:</span> {markdown_inline_to_html(content)}</div>'
+                )
+                pending_empty_reference = False
+            else:
+                formatted_lines.append(
+                    f'<div class="llm-reference-line"><span class="llm-reference-label">{html.escape(label)}:</span></div>'
+                )
+                pending_empty_reference = True
+            continue
+
+        if pending_empty_reference and not line.strip():
+            continue
+
+        if pending_empty_reference:
+            continuation = re.sub(r"^\s*[-*]\s*", "", line.strip())
+            formatted_lines.append(f'<div class="llm-reference-line">{markdown_inline_to_html(continuation)}</div>')
+            pending_empty_reference = False
+            continue
+
+        formatted_lines.append(line)
+
+    return "\n".join(formatted_lines).strip()
+
+
+def render_llm_analysis_markdown(text: Any, *, interpretation_first: bool = False) -> None:
+    st.markdown(format_llm_reference_markdown(text, interpretation_first=interpretation_first), unsafe_allow_html=True)
+
+
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -1548,7 +1699,7 @@ def render_cosponsor_network_section(result: Dict[str, Any]) -> None:
     if analysis:
         with st.container(border=True):
             st.markdown("#### 협업 유형 해석")
-            st.markdown(analysis)
+            render_llm_analysis_markdown(analysis)
 
     party_data = [
         {"name": "당내", "value": as_int(summary.get("당내협업"))},
@@ -1777,7 +1928,7 @@ def render_news_table_timeline(result: Dict[str, Any]) -> None:
     with st.container(border=True):
         st.markdown("#### LLM 분석 요약")
         st.caption("아래 요약은 바로 밑의 뉴스 검색 결과를 근거 자료로 사용해 생성한 해석입니다.")
-        st.markdown(analysis or "최근 이슈 분석 결과가 없습니다.")
+        render_llm_analysis_markdown(analysis or "최근 이슈 분석 결과가 없습니다.")
     if not items:
         st.info("최근 뉴스 데이터가 없습니다.")
         return
@@ -1882,7 +2033,10 @@ def render_summary_tab(result: Dict[str, Any]) -> None:
     st.divider()
 
     st.subheader("입법 관심 분야 분석")
-    st.markdown(result.get("legislative_interest_analysis") or "입법 관심 분야 분석 결과가 없습니다.")
+    render_llm_analysis_markdown(
+        result.get("legislative_interest_analysis") or "입법 관심 분야 분석 결과가 없습니다.",
+        interpretation_first=True,
+    )
     st.divider()
 
     render_vote_summary_chart(result)
@@ -1950,7 +2104,10 @@ def reset_bill_qa_if_needed(result: Dict[str, Any]) -> None:
 def render_bill_qa_message(message: Dict[str, Any], index: int) -> None:
     role = message.get("role", "assistant")
     with st.chat_message(role):
-        st.markdown(str(message.get("content", "")))
+        if role == "assistant":
+            render_llm_analysis_markdown(str(message.get("content", "")))
+        else:
+            st.markdown(str(message.get("content", "")))
         evidence = list(message.get("evidence", []) or [])
         if role == "assistant" and evidence:
             with st.expander("사용한 근거 법안", expanded=False):
@@ -2071,7 +2228,7 @@ def render_votes_tab(result: Dict[str, Any]) -> None:
     vote_interpretation_text = clean_vote_interpretation_text(result.get("vote_interpretation_analysis"))
     if vote_interpretation_text:
         st.subheader("표결 통계 해석 시 주의할 점")
-        st.markdown(vote_interpretation_text)
+        render_llm_analysis_markdown(vote_interpretation_text)
     st.divider()
 
     vote_cols = ["_VOTE_RESULT", "AGE", "VOTE_DATE", "BILL_NO", "BILL_NAME", "LAW_TITLE", "CURR_COMMITTEE", "POLY_NM", "ORIG_NM", "BILL_URL"]
